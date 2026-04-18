@@ -1,0 +1,14 @@
+---
+description: Force mcp-feedback-collector feedback collection before completion
+alwaysApply: true
+---
+
+# Mandatory Feedback Collector
+
+- The MCP server `mcp-feedback-collector` is mandatory in this workspace.
+- Before you finish, conclude, or send a final answer for any real user request, you must call `mcp-feedback-collector.collect_feedback`.
+- If feedback is not empty, continue working on that feedback and call `mcp-feedback-collector.collect_feedback` again.
+- Repeat until the feedback is empty, and only then end the request.
+- If you are about to end without calling the tool, stop and call it first.
+- Never add `--debug` to this MCP server startup command or args, because Cursor requires clean JSON output.
+- Treat this as a hard requirement, not a suggestion.

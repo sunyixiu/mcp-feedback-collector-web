@@ -1,0 +1,12 @@
+---
+description: Forbid all subagents and delegation to protect paid request quota
+alwaysApply: true
+---
+
+# No Subagents
+
+- Never create, call, spawn, delegate to, or request any sub-agent, background agent, helper agent, or multi-agent workflow.
+- Complete all work in the current agent only.
+- If a task feels large, continue locally instead of delegating.
+- Do not suggest agent delegation as a default option.
+- This is a hard rule because subagent usage wastes paid request quota.
