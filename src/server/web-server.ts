@@ -17,6 +17,7 @@ import { ImageProcessor } from '../utils/image-processor.js';
 import { ImageToTextService } from '../utils/image-to-text-service.js';
 import { performanceMonitor } from '../utils/performance-monitor.js';
 import { SessionStorage, SessionData } from '../utils/session-storage.js';
+import { PendingInstructionStore } from '../utils/pending-instruction-store.js';
 import { VERSION } from '../index.js';
 
 /** MCP Streamable HTTP transport 处理函数类型（被 mcp-server.ts 注入） */
@@ -272,6 +273,69 @@ export class WebServer {
     this.app.get('/api/performance-report', (req, res) => {
       const report = performanceMonitor.getFormattedReport();
       res.type('text/plain').send(report);
+    });
+
+    // ========== 临时指令（pending instructions）======================
+    // 用户可以在 Web UI 上插入“临时任务”，agent 在 collect_feedback 之前会先取走。
+    // 设计：FIFO + 取出即删 + 历史保留 24h
+    // ===============================================================
+
+    // 列出当前 pending（仅供 UI 展示）
+    this.app.get('/api/pending-instructions', (req, res) => {
+      try {
+        res.json({ success: true, instructions: PendingInstructionStore.list() });
+      } catch (e) {
+        res.status(500).json({ success: false, error: (e as Error).message });
+      }
+    });
+
+    // 列出最近 24h 已被消费的（用户回查 agent 是否真的做了）
+    this.app.get('/api/pending-instructions/history', (req, res) => {
+      try {
+        res.json({ success: true, history: PendingInstructionStore.history() });
+      } catch (e) {
+        res.status(500).json({ success: false, error: (e as Error).message });
+      }
+    });
+
+    // 添加一条临时指令
+    this.app.post('/api/pending-instructions', (req, res) => {
+      try {
+        const { content } = req.body || {};
+        if (!content || typeof content !== 'string' || !content.trim()) {
+          res.status(400).json({ success: false, error: 'content is required' });
+          return;
+        }
+        const inst = PendingInstructionStore.add(content);
+        logger.info(`新临时指令插入: id=${inst.id} len=${inst.content.length}`);
+        res.json({
+          success: true,
+          instruction: inst,
+          pendingCount: PendingInstructionStore.list().length,
+        });
+      } catch (e) {
+        res.status(500).json({ success: false, error: (e as Error).message });
+      }
+    });
+
+    // 取消一条 pending（用户插错了想删）
+    this.app.delete('/api/pending-instructions/:id', (req, res) => {
+      try {
+        const ok = PendingInstructionStore.cancel(req.params.id);
+        res.json({ success: ok });
+      } catch (e) {
+        res.status(500).json({ success: false, error: (e as Error).message });
+      }
+    });
+
+    // 一键清空 pending（不动 history）
+    this.app.delete('/api/pending-instructions', (req, res) => {
+      try {
+        const n = PendingInstructionStore.clearPending();
+        res.json({ success: true, cleared: n });
+      } catch (e) {
+        res.status(500).json({ success: false, error: (e as Error).message });
+      }
     });
 
     // 图片转文字API

@@ -2,7 +2,7 @@
 REM ==============================================================
 REM MCP Feedback Collector - HTTP (Streamable HTTP / SSE) 模式启动器
 REM ==============================================================
-REM 独立进程，Cursor 通过 url 连接 http://127.0.0.1:5050/mcp
+REM 独立进程，Cursor 通过 url 连接 http://127.0.0.1:18050/mcp
 REM 好处：stdio idle-kill 问题不再复现，前端保活可以真正长时间挂起
 REM
 REM 切到 HTTP 模式的步骤：
@@ -18,7 +18,7 @@ REM ==============================================================
 cd /d "%~dp0"
 
 set MCP_TRANSPORT_MODE=http
-set MCP_WEB_PORT=5050
+set MCP_WEB_PORT=18050
 set MCP_DIALOG_TIMEOUT=300
 set MCP_ENABLE_CHAT=false
 set MCP_ENABLE_IMAGE_TO_TEXT=false

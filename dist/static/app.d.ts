@@ -10,6 +10,7 @@ declare function requestNotificationPermissionOnce(): void;
 declare function showSystemNotification(title: any, body: any): void;
 declare function notifyNewFeedback(summary: any): void;
 declare function loadChatConfig(): Promise<boolean>;
+declare function bindFeedbackTextareaEnhancements(): void;
 declare function initializeSocket(): void;
 declare function updateConnectionStatus(status: any, text: any): void;
 declare function showStatusMessage(type: any, message: any, autoRemove?: boolean): HTMLDivElement;
@@ -115,6 +116,18 @@ declare function startKeepAliveMonitor(): void;
  * 停止空闲保活监控
  */
 declare function stopKeepAliveMonitor(): void;
+declare function initPendingInstructionsUI(): void;
+declare function injectPendingStyles(): void;
+declare function injectPendingDom(): void;
+declare function bindPendingHandlers(): void;
+declare function submitPending(): Promise<void>;
+declare function refreshPendingList(): Promise<void>;
+declare function renderPendingBadge(count: any): void;
+declare function renderPendingList(list: any): void;
+declare function cancelPending(id: any): Promise<void>;
+declare function clearPending(): Promise<void>;
+declare function setPendingError(msg: any): void;
+declare function escapeHtml(s: any): string;
 /**
  * MCP Feedback Collector - 前端应用脚本
  */
@@ -153,5 +166,7 @@ declare let _lastRingSummaryHash: null;
 declare let _backgroundRingInterval: null;
 declare const NOTIFY_SOUND_KEY: "mcp_notify_sound_enabled";
 declare const BACKGROUND_RING_INTERVAL_MS: 25000;
-declare const QUICK_PHRASE: "\n\n---\n\nWhenever you want to ask a question, always call the MCP .\n\nWhenever you're about to complete a user request, call the MCP instead of simply ending the process. Keep calling MCP until the user's feedback is empty, then end the request. mcp-feedback-collector.collect_feedback";
+declare const QUICK_PHRASE: "\n\n---\n\nWhenever you want to ask a question, always call the MCP .\n\nWhenever you are about to complete a user request, call the MCP instead of simply ending the process. Keep calling MCP until the users feedback is empty, then end the request. mcp-feedback-collector.collect_feedback\n\n**Workflow before ending each turn:**\n1. Call `check_pending_instructions` first \u2014 if instructions exist, process them in FIFO order before collecting feedback.\n2. Only call `collect_feedback` when `check_pending_instructions` returns an empty list.\n3. Keep calling `collect_feedback` until the user feedback is empty, then end the request.\n\n**How to call (MCP tool):**\n- Server priority (try in order): `project-0-booking-theoryabc-mcp-feedback-collector` \u2192 `user-mcp-feedback-collector-stdio` \u2192 `user-mcp-feedback-collector-backup`\n- Tool: `collect_feedback` with argument `{ \"work_summary\": \"<your summary>\" }`\n- Tool: `check_pending_instructions` with no arguments\n- If a server returns \"Not connected\" or \"tool not found\", try the next server.\n\n**Inserting temporary instructions:**\n- Users can insert out-of-band instructions at any time via the feedback web UI.\n- The agent MUST call `check_pending_instructions` before `collect_feedback` to pick these up.\n- This saves communication time by allowing async task injection.";
+declare const PENDING_API: "/api/pending-instructions";
+declare let pendingPollTimer: null;
 //# sourceMappingURL=app.d.ts.map

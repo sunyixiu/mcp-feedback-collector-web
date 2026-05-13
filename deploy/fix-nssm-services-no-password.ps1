@@ -21,7 +21,7 @@ if (-not $me.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
 }
 
 $services = @('McpFeedbackCollector', 'McpFeedbackCollectorBackup')
-$ports = @{ 'McpFeedbackCollector' = 5050; 'McpFeedbackCollectorBackup' = 5051 }
+$ports = @{ 'McpFeedbackCollector' = 18050; 'McpFeedbackCollectorBackup' = 18051 }
 
 Write-Host "`n[1/4] 停服务..." -ForegroundColor Cyan
 foreach ($s in $services) { & $NSSM stop $s confirm 2>&1 | Out-Null }
@@ -61,5 +61,5 @@ foreach ($s in $services) {
     $st = & $NSSM status $s 2>&1
     Write-Host "  $s -> $st"
 }
-netstat -ano | Select-String ":505[01]\s.*LISTENING" | ForEach-Object { "  $_" }
+netstat -ano | Select-String ":1805[01]\s.*LISTENING" | ForEach-Object { "  $_" }
 Write-Host "`n[√] OK. 重启 Cursor 后 HTTP 三条腿应该都绿。" -ForegroundColor Green

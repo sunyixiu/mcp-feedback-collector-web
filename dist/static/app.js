@@ -42,6 +42,19 @@ const KEEP_ALIVE_IDLE_MS = 180000; // 3分钟无操作则发保活
 const KEEP_ALIVE_CHECK_MS = 30000; // 每30秒检查一次
 
 // ============================================================
+// 📝 草稿历史（防丢）
+// ------------------------------------------------------------
+// 用户输入反馈时实时保存到 localStorage，最多保留 10 条。
+// 提交成功 → 标记 sent；提交失败 / 超时 → 标记 failed；编辑中 → editing。
+// 失败/超时后用户可以从左侧抽屉点回任一草稿恢复到输入框。
+// ============================================================
+const DRAFTS_KEY = 'mcp_feedback_drafts_v1';
+const DRAFTS_MAX = 10;
+const DRAFT_DEBOUNCE_MS = 300;
+let _currentDraftId = null;          // 当前正在编辑的 draft id
+let _draftSaveTimer = null;          // debounce 定时器
+
+// ============================================================
 // 🔔 新反馈到达提醒（铃声 + 浏览器通知 + 标题闪烁）
 // ------------------------------------------------------------
 // 当 5050 / 5051 HTTP 模式跑在 Windows 服务 (Session 0) 时，
@@ -318,7 +331,76 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // 启动空闲保活机制
     startKeepAliveMonitor();
+
+    // 反馈输入框增强：Enter 提交（Shift+Enter 换行），Ctrl+V 粘贴图片
+    bindFeedbackTextareaEnhancements();
+
+    // 临时任务（pending instructions）UI：右上角浮动按钮 + 弹窗
+    initPendingInstructionsUI();
+
+    // 草稿历史抽屉（左侧）+ 实时存档防丢
+    initDraftsUI();
 });
+
+// ============================================================
+// 反馈输入框增强：
+//   1) 回车键直接提交（Shift+Enter 仍是换行）
+//   2) Ctrl/Cmd+V 直接粘贴图片到附件区
+// ============================================================
+function bindFeedbackTextareaEnhancements() {
+    const textarea = document.getElementById('feedback-text');
+    const form = document.getElementById('feedback-form');
+    if (!textarea || !form) return;
+
+    // 防重复绑定（开发热更新场景）
+    if (textarea.dataset.enhBound === '1') return;
+    textarea.dataset.enhBound = '1';
+
+    // ---- 1) 回车提交 ----
+    textarea.addEventListener('keydown', function(e) {
+        // 中文/日文等输入法 composition 进行中时不要拦截
+        if (e.isComposing || e.keyCode === 229) return;
+        if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            e.preventDefault();
+            // 使用 requestSubmit 走原生 submit 事件流，与原 form 提交逻辑一致
+            if (typeof form.requestSubmit === 'function') {
+                form.requestSubmit();
+            } else {
+                form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+            }
+        }
+    });
+
+    // ---- 2) 粘贴图片 ----
+    textarea.addEventListener('paste', function(e) {
+        const cd = e.clipboardData || window.clipboardData;
+        if (!cd || !cd.items) return;
+        let imageHandled = false;
+        for (const item of cd.items) {
+            if (item.kind === 'file' && item.type && item.type.startsWith('image/')) {
+                const blob = item.getAsFile();
+                if (blob) {
+                    const ext = (blob.type.split('/')[1] || 'png').replace('+xml', '');
+                    const file = new File([blob], `pasted-image-${Date.now()}.${ext}`, { type: blob.type });
+                    addImage(file);
+                    imageHandled = true;
+                }
+            }
+        }
+        if (imageHandled) {
+            // 阻止把二进制 / 文件名字符串粘到 textarea 里
+            e.preventDefault();
+            try { showStatusMessage('success', '已粘贴图片到附件'); } catch (_) {}
+        }
+        // 没图片就走默认行为：正常粘贴文本
+    });
+
+    // placeholder 提示也更新一下，告诉用户支持快捷键
+    if (!textarea.placeholder || textarea.placeholder.indexOf('Enter') === -1) {
+        textarea.placeholder = (textarea.placeholder || '') +
+            '（Enter 发送，Shift+Enter 换行，Ctrl+V 粘贴图片）';
+    }
+}
 
 // 初始化WebSocket连接
 function initializeSocket() {
@@ -356,6 +438,9 @@ function initializeSocket() {
     });
 
     socket.on('feedback_submitted', function(data) {
+        // 草稿标 sent
+        document.dispatchEvent(new CustomEvent('mcp:feedback-sent'));
+
         clearFeedbackForm();
 
         // 重新启用提交按钮
@@ -394,7 +479,16 @@ function initializeSocket() {
     });
 
     socket.on('feedback_error', function(data) {
+        // 草稿标 failed（用户的输入仍可在抽屉中找回）
+        document.dispatchEvent(new CustomEvent('mcp:feedback-failed', { detail: { error: data?.error } }));
+
         showStatusMessage('error', data.error);
+        // 提交按钮恢复，让用户可以再次提交（或修改后重提）
+        const submitBtn = document.getElementById('submit-feedback-btn');
+        if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = '提交反馈';
+        }
     });
 
     socket.on('work_summary_data', function(data) {
@@ -430,23 +524,13 @@ function initializeSocket() {
 
             // 如果有工作汇报，显示它
             if (data.work_summary) {
-                // 检查是否是新内容（如果页面已经有内容）
-                const hasExistingContent = lastWorkSummary && lastWorkSummary !== data.work_summary;
-
                 displayWorkSummary(data.work_summary);
-
-                // 如果是新内容且页面已经有内容，自动刷新页面
-                if (hasExistingContent) {
-                    console.log('检测到新的工作汇报内容，3秒后自动刷新页面以重置会话');
-                    showRefreshStatus('success', '✅ 检测到新工作汇报，页面将自动刷新');
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 3000);
-                } else {
-                    // 记录初始工作汇报内容
-                    lastWorkSummary = data.work_summary;
-                    showTab('feedback');
-                }
+                lastWorkSummary = data.work_summary;
+                showTab('feedback');
+                // 注意：原本这里在「页面已有旧内容 + 新内容不同」时会强制 reload，
+                // 但 session_assigned 本身就会带着新 work_summary 进来，
+                // 直接 displayWorkSummary 已经更新内容；reload 反而触发整个流程再走一遍。
+                // 已移除 reload。
             }
         }
     });
@@ -481,6 +565,14 @@ function initializeSocket() {
                 displayWorkSummary(data.work_summary);
                 // 更新记录的内容
                 lastWorkSummary = data.work_summary;
+                // 切换 session（新会话 ID 进来）→ 同步更新 currentFeedbackSession
+                // 这样后续 submit_feedback 不会用旧 sessionId
+                if (data.session_id && data.session_id !== currentFeedbackSession) {
+                    console.log(`session 切换: ${currentFeedbackSession} → ${data.session_id}`);
+                    currentFeedbackSession = data.session_id;
+                    // 重置前端超时（用新会话默认 5 分钟，无 timeout 字段）
+                    startSessionTimeout(sessionTimeoutDuration);
+                }
                 // 🔔 新反馈提醒（去重）
                 _maybeRing(data.session_id || currentFeedbackSession, data.work_summary);
                 // 恢复按钮文字
@@ -488,14 +580,11 @@ function initializeSocket() {
                 if (refreshText) {
                     refreshText.textContent = '刷新最新汇报';
                 }
-                // 使用文字状态显示，而不是弹出提示
-                showRefreshStatus('success', '✅ 已获取最新工作汇报，页面将自动刷新');
-
-                // 获取到新内容后自动刷新页面，解决会话过期问题
-                console.log('检测到新的工作汇报内容，3秒后自动刷新页面以重置会话');
-                setTimeout(() => {
-                    window.location.reload();
-                }, 3000);
+                showRefreshStatus('success', '✅ 已获取最新工作汇报');
+                // 注意：原本这里有 setTimeout reload 页面的逻辑
+                // 移除原因：reload 后 request_session 会再次触发 session_assigned + displayWorkSummary + _maybeRing
+                // 造成「同一个 work_summary 推两遍」+ 重复响铃。
+                // 现在 currentFeedbackSession 已就地更新，不需要 reload。
             } else {
                 // 内容相同，显示无变化状态
                 showRefreshStatus('success', '内容无变化');
@@ -770,7 +859,23 @@ const QUICK_PHRASE = `
 
 Whenever you want to ask a question, always call the MCP .
 
-Whenever you're about to complete a user request, call the MCP instead of simply ending the process. Keep calling MCP until the user's feedback is empty, then end the request. mcp-feedback-collector.collect_feedback`;
+Whenever you are about to complete a user request, call the MCP instead of simply ending the process. Keep calling MCP until the users feedback is empty, then end the request. mcp-feedback-collector.collect_feedback
+
+**Workflow before ending each turn:**
+1. Call \`check_pending_instructions\` first — if instructions exist, process them in FIFO order before collecting feedback.
+2. Only call \`collect_feedback\` when \`check_pending_instructions\` returns an empty list.
+3. Keep calling \`collect_feedback\` until the user feedback is empty, then end the request.
+
+**How to call (MCP tool):**
+- Server priority (try in order): \`project-0-booking-theoryabc-mcp-feedback-collector\` → \`user-mcp-feedback-collector-stdio\` → \`user-mcp-feedback-collector-backup\`
+- Tool: \`collect_feedback\` with argument \`{ "work_summary": "<your summary>" }\`
+- Tool: \`check_pending_instructions\` with no arguments
+- If a server returns "Not connected" or "tool not found", try the next server.
+
+**Inserting temporary instructions:**
+- Users can insert out-of-band instructions at any time via the feedback web UI.
+- The agent MUST call \`check_pending_instructions\` before \`collect_feedback\` to pick these up.
+- This saves communication time by allowing async task injection.`;
 
 // 提交反馈
 document.getElementById('feedback-form').addEventListener('submit', function(e) {
@@ -1766,3 +1871,496 @@ function stopKeepAliveMonitor() {
         keepAliveCheckInterval = null;
     }
 }
+
+// ============================================================
+// 临时任务（pending instructions）UI
+//   - 右上角浮动按钮，点击弹出输入框
+//   - 用户提交后写入服务器；agent 在 collect_feedback 之前会先 check 取走
+//   - 队列里有任务时按钮显示数字角标
+// ============================================================
+
+const PENDING_API = '/api/pending-instructions';
+let pendingPollTimer = null;
+
+function initPendingInstructionsUI() {
+    if (document.getElementById('pti-fab')) return; // 防重复
+    injectPendingStyles();
+    injectPendingDom();
+    bindPendingHandlers();
+    refreshPendingList();
+    if (pendingPollTimer) clearInterval(pendingPollTimer);
+    pendingPollTimer = setInterval(refreshPendingList, 5000);
+}
+
+function injectPendingStyles() {
+    const css = `
+    .pti-fab {
+      position: fixed; top: 20px; right: 160px;
+      z-index: 9998;
+      background: #c9a227; color: #1e1e1e;
+      border: none; border-radius: 6px;
+      padding: 7px 14px; font-size: 12px; font-weight: 600;
+      cursor: pointer; box-shadow: 0 2px 10px rgba(201,162,39,0.35);
+      transition: transform 0.12s, box-shadow 0.18s;
+      display: inline-flex; align-items: center; gap: 6px;
+      font-family: inherit;
+    }
+    .pti-fab:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(201,162,39,0.55); }
+    .pti-fab .pti-badge {
+      display: inline-block; min-width: 18px; height: 18px; padding: 0 5px;
+      background: #ff4d4f; color: #fff; border-radius: 9px;
+      font-size: 11px; line-height: 18px; text-align: center; font-weight: 700;
+    }
+    .pti-mask {
+      position: fixed; inset: 0; z-index: 9999;
+      background: rgba(0,0,0,0.5); display: none;
+      align-items: center; justify-content: center;
+    }
+    .pti-mask.visible { display: flex; }
+    .pti-card {
+      background: #252526; color: #cccccc;
+      width: 480px; max-width: 92vw; max-height: 85vh; overflow: auto;
+      border-radius: 8px; padding: 22px 24px;
+      border: 1px solid #3c3c3c; box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    }
+    .pti-card h3 { margin: 0 0 6px; font-size: 16px; color: #fff; }
+    .pti-card .pti-tip { margin: 0 0 14px; font-size: 12px; color: #969696; line-height: 1.6; }
+    .pti-card textarea {
+      width: 100%; min-height: 80px; max-height: 200px;
+      background: #1e1e1e; color: #e8e8e8;
+      border: 1px solid #3c3c3c; border-radius: 4px;
+      padding: 10px 12px; font-size: 13px; font-family: inherit; resize: vertical;
+    }
+    .pti-card textarea:focus { outline: none; border-color: #c9a227; }
+    .pti-list-wrap {
+      margin-top: 16px; padding-top: 12px;
+      border-top: 1px solid #3c3c3c;
+    }
+    .pti-list-title {
+      font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase;
+      color: #c9a227; margin-bottom: 8px; font-weight: 700;
+    }
+    .pti-list { list-style: none; margin: 0; padding: 0; max-height: 180px; overflow-y: auto; }
+    .pti-list li {
+      display: flex; gap: 8px; align-items: flex-start;
+      padding: 6px 8px; border-bottom: 1px solid #2d2d2d;
+      font-size: 12px;
+    }
+    .pti-list li:last-child { border-bottom: none; }
+    .pti-list-content { flex: 1; word-break: break-word; }
+    .pti-list-time { color: #6c6c6c; font-size: 10px; }
+    .pti-list-del {
+      background: none; border: none; color: #888;
+      cursor: pointer; font-size: 14px; line-height: 1;
+    }
+    .pti-list-del:hover { color: #ff4d4f; }
+    .pti-empty { color: #6c6c6c; font-style: italic; padding: 8px 4px; }
+    .pti-buttons {
+      display: flex; gap: 10px; justify-content: flex-end;
+      margin-top: 18px;
+    }
+    .pti-buttons button {
+      padding: 7px 16px; border-radius: 4px; font-size: 12px;
+      cursor: pointer; border: 1px solid #3c3c3c;
+      background: #2d2d2d; color: #cccccc; font-family: inherit;
+    }
+    .pti-buttons button:hover { background: #3a3a3a; }
+    .pti-buttons button.primary {
+      background: #c9a227; border-color: #c9a227; color: #1e1e1e; font-weight: 700;
+    }
+    .pti-buttons button.primary:hover { background: #b8901c; border-color: #b8901c; }
+    .pti-buttons button.danger {
+      background: transparent; border-color: #5a3030; color: #ff7a7a;
+    }
+    .pti-buttons button.danger:hover { background: #3a2020; }
+    .pti-error { color: #ff7a7a; font-size: 12px; margin-top: 8px; min-height: 16px; }
+    `;
+    const style = document.createElement('style');
+    style.id = 'pti-style';
+    style.textContent = css;
+    document.head.appendChild(style);
+}
+
+function injectPendingDom() {
+    const fab = document.createElement('button');
+    fab.id = 'pti-fab';
+    fab.className = 'pti-fab';
+    fab.title = '插入临时任务给 AI（AI 下次调用 collect_feedback 之前会先取走）';
+    fab.innerHTML = '📥 插入临时任务<span class="pti-badge" id="pti-badge" style="display:none">0</span>';
+    document.body.appendChild(fab);
+
+    const mask = document.createElement('div');
+    mask.id = 'pti-mask';
+    mask.className = 'pti-mask';
+    mask.innerHTML = `
+      <div class="pti-card" id="pti-card">
+        <h3>📥 插入临时任务</h3>
+        <p class="pti-tip">
+          AI 在下次调用 collect_feedback 之前会先来取走这些任务并按 FIFO 顺序执行。<br />
+          取走后会立即从队列中移除（不会重复执行）。
+        </p>
+        <textarea id="pti-input" placeholder="例如：把刚才那个按钮颜色改成蓝色，再加一个 hover 效果"></textarea>
+        <div class="pti-error" id="pti-error"></div>
+
+        <div class="pti-list-wrap">
+          <div class="pti-list-title">待办队列 (FIFO，共 <span id="pti-count">0</span> 条)</div>
+          <ul id="pti-list" class="pti-list">
+            <li class="pti-empty">暂无</li>
+          </ul>
+        </div>
+
+        <div class="pti-buttons">
+          <button id="pti-clear" class="danger">清空</button>
+          <button id="pti-cancel">关闭</button>
+          <button id="pti-submit" class="primary">提交</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(mask);
+}
+
+function bindPendingHandlers() {
+    const fab = document.getElementById('pti-fab');
+    const mask = document.getElementById('pti-mask');
+    const card = document.getElementById('pti-card');
+    const input = document.getElementById('pti-input');
+    const submit = document.getElementById('pti-submit');
+    const cancel = document.getElementById('pti-cancel');
+    const clearBtn = document.getElementById('pti-clear');
+
+    const open = () => {
+        mask.classList.add('visible');
+        refreshPendingList();
+        setTimeout(() => input?.focus(), 50);
+    };
+    const close = () => {
+        mask.classList.remove('visible');
+        setPendingError('');
+    };
+
+    fab.addEventListener('click', open);
+    cancel.addEventListener('click', close);
+    mask.addEventListener('click', (e) => { if (e.target === mask) close(); });
+    card.addEventListener('click', (e) => e.stopPropagation());
+
+    input.addEventListener('keydown', (e) => {
+        // Ctrl/Cmd+Enter 提交（避免和换行冲突）
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            e.preventDefault();
+            submitPending();
+        }
+    });
+
+    submit.addEventListener('click', submitPending);
+    clearBtn.addEventListener('click', clearPending);
+}
+
+async function submitPending() {
+    const input = document.getElementById('pti-input');
+    const content = (input?.value || '').trim();
+    if (!content) {
+        setPendingError('请填写指令内容');
+        return;
+    }
+    setPendingError('');
+    try {
+        const r = await fetch(PENDING_API, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content }),
+        });
+        const d = await r.json();
+        if (!d.success) throw new Error(d.error || '提交失败');
+        input.value = '';
+        await refreshPendingList();
+        try { showStatusMessage('success', '已插入临时任务'); } catch (_) {}
+    } catch (e) {
+        setPendingError(e.message || '网络错误');
+    }
+}
+
+async function refreshPendingList() {
+    try {
+        const r = await fetch(PENDING_API);
+        const d = await r.json();
+        if (!d.success) return;
+        const list = d.instructions || [];
+        renderPendingList(list);
+        renderPendingBadge(list.length);
+    } catch (_) { /* swallow */ }
+}
+
+function renderPendingBadge(count) {
+    const badge = document.getElementById('pti-badge');
+    if (!badge) return;
+    if (count > 0) {
+        badge.textContent = String(count);
+        badge.style.display = 'inline-block';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
+function renderPendingList(list) {
+    const ul = document.getElementById('pti-list');
+    const cnt = document.getElementById('pti-count');
+    if (!ul) return;
+    if (cnt) cnt.textContent = String(list.length);
+    if (!list.length) {
+        ul.innerHTML = '<li class="pti-empty">暂无</li>';
+        return;
+    }
+    ul.innerHTML = list.map((it, idx) => `
+      <li>
+        <span class="pti-list-content"><b>#${idx + 1}</b> ${escapeHtml(it.content)}<br /><span class="pti-list-time">${new Date(it.createdAt).toLocaleString()}</span></span>
+        <button class="pti-list-del" data-id="${it.id}" title="取消这条">✕</button>
+      </li>
+    `).join('');
+    ul.querySelectorAll('.pti-list-del').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const id = btn.getAttribute('data-id');
+            await cancelPending(id);
+        });
+    });
+}
+
+async function cancelPending(id) {
+    try {
+        await fetch(`${PENDING_API}/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        await refreshPendingList();
+    } catch (_) { /* swallow */ }
+}
+
+async function clearPending() {
+    if (!confirm('确认清空所有 pending 任务？')) return;
+    try {
+        await fetch(PENDING_API, { method: 'DELETE' });
+        await refreshPendingList();
+    } catch (_) { /* swallow */ }
+}
+
+function setPendingError(msg) {
+    const el = document.getElementById('pti-error');
+    if (el) el.textContent = msg || '';
+}
+
+function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// ============================================================
+// 📝 草稿历史 — 实时存档 + 失败恢复
+// ============================================================
+
+function _draftsLoad() {
+    try {
+        const raw = localStorage.getItem(DRAFTS_KEY);
+        if (!raw) return [];
+        const arr = JSON.parse(raw);
+        return Array.isArray(arr) ? arr : [];
+    } catch (e) {
+        console.warn('[drafts] 解析失败，重置为空', e);
+        return [];
+    }
+}
+
+function _draftsSave(arr) {
+    try {
+        // 始终按 ts 倒序，截到 DRAFTS_MAX
+        const sorted = arr
+            .slice()
+            .sort((a, b) => (b.ts || 0) - (a.ts || 0))
+            .slice(0, DRAFTS_MAX);
+        localStorage.setItem(DRAFTS_KEY, JSON.stringify(sorted));
+    } catch (e) {
+        console.warn('[drafts] 写入 localStorage 失败', e);
+    }
+}
+
+function _draftsGenId() {
+    return `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * 实时保存当前草稿（debounce）
+ * - 文本为空 + 草稿状态为 editing → 删除该草稿（避免空记录）
+ * - 文本非空 → 更新或插入
+ */
+function saveCurrentDraft(text) {
+    if (_draftSaveTimer) clearTimeout(_draftSaveTimer);
+    _draftSaveTimer = setTimeout(() => {
+        const drafts = _draftsLoad();
+        const trimmed = (text || '').trim();
+
+        if (!trimmed) {
+            // 空 → 移除当前 editing 草稿
+            if (_currentDraftId) {
+                const idx = drafts.findIndex(d => d.id === _currentDraftId);
+                if (idx >= 0 && drafts[idx].status === 'editing') {
+                    drafts.splice(idx, 1);
+                    _draftsSave(drafts);
+                    _currentDraftId = null;
+                    renderDraftsList();
+                }
+            }
+            return;
+        }
+
+        // 非空：更新或插入
+        if (!_currentDraftId) {
+            _currentDraftId = _draftsGenId();
+        }
+        const idx = drafts.findIndex(d => d.id === _currentDraftId);
+        const entry = {
+            id: _currentDraftId,
+            ts: Date.now(),
+            text,
+            sessionId: currentFeedbackSession || null,
+            status: 'editing',
+        };
+        if (idx >= 0) {
+            // 保留之前 status（被标记 sent/failed 的不应回滚到 editing）
+            // 但用户继续编辑同一条 → 应当复活为 editing
+            drafts[idx] = { ...drafts[idx], ...entry, status: 'editing' };
+        } else {
+            drafts.push(entry);
+        }
+        _draftsSave(drafts);
+        renderDraftsList();
+    }, DRAFT_DEBOUNCE_MS);
+}
+
+/**
+ * 标记当前正在编辑的草稿为某种状态
+ * 提交开始时不立即标记；提交成功才标 sent；提交失败/超时标 failed。
+ */
+function markCurrentDraft(status) {
+    if (!_currentDraftId) return;
+    const drafts = _draftsLoad();
+    const idx = drafts.findIndex(d => d.id === _currentDraftId);
+    if (idx >= 0) {
+        drafts[idx] = {
+            ...drafts[idx],
+            status,
+            ts_status: Date.now(),
+        };
+        _draftsSave(drafts);
+    }
+    if (status === 'sent') {
+        // 提交成功 → 释放 currentDraftId，下次输入开新草稿
+        _currentDraftId = null;
+    }
+    renderDraftsList();
+}
+
+function deleteDraft(id) {
+    const drafts = _draftsLoad().filter(d => d.id !== id);
+    _draftsSave(drafts);
+    if (_currentDraftId === id) _currentDraftId = null;
+    renderDraftsList();
+}
+
+function clearAllDrafts() {
+    if (!confirm('确认清空所有草稿？此操作不可恢复。')) return;
+    localStorage.removeItem(DRAFTS_KEY);
+    _currentDraftId = null;
+    renderDraftsList();
+}
+
+function restoreDraft(id) {
+    const drafts = _draftsLoad();
+    const d = drafts.find(x => x.id === id);
+    if (!d) return;
+    const ta = document.getElementById('feedback-text');
+    if (!ta) return;
+    ta.value = d.text || '';
+    // 切到 feedback tab 让用户看到
+    if (typeof showTab === 'function') showTab('feedback');
+    ta.focus();
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    // 让 currentDraftId 指向恢复的这条，继续编辑就在原条上更新
+    _currentDraftId = d.id;
+    showStatusMessage('success', '已恢复草稿到输入框', true);
+}
+
+function renderDraftsList() {
+    const list = document.getElementById('drafts-list');
+    const badge = document.getElementById('drafts-badge');
+    if (!list) return;
+    const drafts = _draftsLoad();
+    if (badge) {
+        if (drafts.length > 0) {
+            badge.hidden = false;
+            badge.textContent = String(drafts.length);
+        } else {
+            badge.hidden = true;
+        }
+    }
+    if (drafts.length === 0) {
+        list.innerHTML = '<div class="drafts-empty">暂无草稿</div>';
+        return;
+    }
+    list.innerHTML = drafts.map(d => {
+        const status = d.status || 'editing';
+        const statusLabel = { editing: '编辑中', sent: '已提交', failed: '提交失败' }[status] || status;
+        const time = new Date(d.ts).toLocaleString();
+        return `
+          <div class="draft-item draft-status-${status}" data-id="${d.id}">
+            <div class="draft-item-meta">
+              <span class="draft-item-status">${statusLabel}</span>
+              <span>${time}</span>
+            </div>
+            <div class="draft-item-text">${escapeHtml(d.text || '')}</div>
+            <div class="draft-item-actions">
+              <button class="draft-action-btn" data-action="restore" data-id="${d.id}">恢复</button>
+              <button class="draft-action-btn danger" data-action="delete" data-id="${d.id}">删除</button>
+            </div>
+          </div>
+        `;
+    }).join('');
+    list.querySelectorAll('.draft-action-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const id = btn.getAttribute('data-id');
+            const action = btn.getAttribute('data-action');
+            if (action === 'restore') restoreDraft(id);
+            if (action === 'delete') deleteDraft(id);
+        });
+    });
+    // 整条点击也恢复
+    list.querySelectorAll('.draft-item').forEach(it => {
+        it.addEventListener('click', () => {
+            const id = it.getAttribute('data-id');
+            restoreDraft(id);
+        });
+    });
+}
+
+function initDraftsUI() {
+    const drawer = document.getElementById('drafts-drawer');
+    const toggle = document.getElementById('drafts-toggle');
+    const clearBtn = document.getElementById('drafts-clear-btn');
+    const ta = document.getElementById('feedback-text');
+    if (!drawer || !toggle || !ta) return;
+
+    toggle.addEventListener('click', () => {
+        drawer.classList.toggle('collapsed');
+    });
+    if (clearBtn) clearBtn.addEventListener('click', clearAllDrafts);
+
+    // 输入实时存档（debounce）
+    ta.addEventListener('input', () => {
+        saveCurrentDraft(ta.value);
+    });
+
+    // 提交成功事件 → 标 sent
+    document.addEventListener('mcp:feedback-sent', () => markCurrentDraft('sent'));
+    // 提交失败事件 → 标 failed
+    document.addEventListener('mcp:feedback-failed', () => markCurrentDraft('failed'));
+
+    // 首次渲染
+    renderDraftsList();
+}
+

@@ -10,6 +10,7 @@ import { randomUUID } from 'crypto';
 import { MCPError } from '../types/index.js';
 import { logger } from '../utils/logger.js';
 import { WebServer } from './web-server.js';
+import { PendingInstructionStore } from '../utils/pending-instruction-store.js';
 // 心跳间隔（毫秒）。用 ping 请求（双向）替代 log notification，Cursor V2 FSM 只认 client/server 双向流量
 const HEARTBEAT_INTERVAL_MS = 20000;
 // 心跳连续失败多少次后标记连接异常
@@ -77,6 +78,9 @@ export class MCPServer {
             'comment',
             'task_summary',
             'taskSummary',
+            'question',
+            'prompt',
+            'ask',
         ];
         for (const key of aliasKeys) {
             if (args[key] !== undefined && args[key] !== null) {
@@ -112,6 +116,8 @@ export class MCPServer {
                 feedback: z.string().optional().describe('Alias for work_summary'),
                 description: z.string().optional().describe('Alias for work_summary'),
                 report: z.string().optional().describe('Alias for work_summary'),
+                question: z.string().optional().describe('Alias for work_summary'),
+                prompt: z.string().optional().describe('Alias for work_summary'),
             }
         }, async (args) => {
             const resolvedSummary = this.extractWorkSummary(args);
@@ -130,6 +136,47 @@ export class MCPServer {
                     throw error;
                 }
                 throw new MCPError('Failed to collect feedback', 'COLLECT_FEEDBACK_ERROR', error);
+            }
+        });
+        // ========== check_pending_instructions ==========
+        // 取出（FIFO）+ 立即从 pending 队列移除 + 归档到 history
+        // agent 工作流：
+        //   每次 collect_feedback 之前先调这个，
+        //   返回非空 → 先把这些指令做掉再调本工具直到空 → 再 collect_feedback
+        this.mcpServer.registerTool('check_pending_instructions', {
+            description: 'Check if the user has inserted any out-of-band instructions during your work. ' +
+                'Call this BEFORE collect_feedback. If the returned list is non-empty, ' +
+                'address those instructions first (FIFO order), then call this tool again. ' +
+                'Only call collect_feedback when this tool returns an empty list.',
+            inputSchema: {}
+        }, async () => {
+            try {
+                const taken = PendingInstructionStore.consumeAll();
+                if (!taken.length) {
+                    return {
+                        content: [{ type: 'text', text: 'NO_PENDING_INSTRUCTIONS' }],
+                        isError: false
+                    };
+                }
+                const lines = [
+                    `PENDING_INSTRUCTIONS_FOUND count=${taken.length}`,
+                    'Process them in order. Each line below is one instruction:',
+                    ...taken.map((t, idx) => `[#${idx + 1}] ${t.content}`),
+                    '',
+                    'After completing them, call check_pending_instructions again to check for more.',
+                ];
+                logger.info(`check_pending_instructions: 取走 ${taken.length} 条`);
+                return {
+                    content: [{ type: 'text', text: lines.join('\n') }],
+                    isError: false
+                };
+            }
+            catch (error) {
+                logger.error('check_pending_instructions failed:', error);
+                return {
+                    content: [{ type: 'text', text: `Error: ${error.message}` }],
+                    isError: true
+                };
             }
         });
         if (logger.getLevel() !== 'silent') {

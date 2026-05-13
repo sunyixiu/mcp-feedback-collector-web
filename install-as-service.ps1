@@ -1,4 +1,4 @@
-﻿# ============================================================
+# ============================================================
 # MCP Feedback Collector - 一键装成 Windows 服务（primary + backup）
 # ============================================================
 # 使用方法：
@@ -36,15 +36,15 @@ New-Item -ItemType Directory -Force -Path $LOG_DIR | Out-Null
 $services = @(
     @{
         Name='McpFeedbackCollector'
-        DisplayName='MCP Feedback Collector (Primary :5050)'
-        Description='Primary MCP feedback collector HTTP server on port 5050.'
-        Port=5050
+        DisplayName='MCP Feedback Collector (Primary :18050)'
+        Description='Primary MCP feedback collector HTTP server on port 18050.'
+        Port=18050
     },
     @{
         Name='McpFeedbackCollectorBackup'
-        DisplayName='MCP Feedback Collector (Backup :5051)'
-        Description='Backup MCP feedback collector HTTP server on port 5051.'
-        Port=5051
+        DisplayName='MCP Feedback Collector (Backup :18051)'
+        Description='Backup MCP feedback collector HTTP server on port 18051.'
+        Port=18051
     }
 )
 
@@ -126,7 +126,7 @@ function Show-Status() {
         }
     }
     Write-Host "`n端口占用检查:"
-    foreach ($port in 5050,5051) {
+    foreach ($port in 18050,18051) {
         $line = (netstat -ano | Select-String ":$port\s.*LISTENING")
         if ($line) { Write-Host "  :$port LISTENING" -ForegroundColor Green }
         else       { Write-Host "  :$port 无监听" -ForegroundColor Red }
