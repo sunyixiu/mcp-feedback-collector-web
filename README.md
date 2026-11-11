@@ -197,6 +197,17 @@ mcp-feedback-collector config
 Whenever you’re about to complete a user request, call the MCP instead of simply ending the process. Keep calling MCP until the user’s feedback is empty, then end the request. mcp-feedback-collector.collect_feedback ”
 
 
+### AI 代理使用手册（规则，必须遵守）
+
+异步三件套：`collect_feedback` 立即返回 `session_id` → `wait_feedback` 最多等 45 秒 → `poll_feedback` 立即查询。会话服务端超时 `MCP_DIALOG_TIMEOUT`（默认 300 秒）后变为 `timed_out`，并自动代答「用户暂时未回复（连续第 N/30 次超时）」，连续 30 次才熔断。
+
+1. **提问、确认、汇报都走 `collect_feedback`**，不能只在聊天里问完就结束。
+2. **结束前循环**：汇报 → 等回复 → 用户有内容就处理后再汇报 → 只有用户反馈为空（或明确说结束）才结束。
+3. **`wait_feedback` 单次不要超过 45 秒**。`MCP_MAX_WAIT_SECONDS` 可调，但 120 秒实测会被 Cursor 截断（`MCP error -32000: Connection closed`），MCP 进程被重启，会话丢失。
+4. **轮换查询，防「死循环/假死」误判**：`wait_feedback` → `poll_feedback` → `check_pending_instructions` 交替调用，**严禁连续 3 次以上调用同一个工具**，否则会被 Cursor 当作空转强制中断，用户回复就落在被丢下的会话里。
+5. **会话 `timed_out` 后**用 `collect_feedback` 开新会话继续，不要就此结束。
+6. **每轮对话开始**先 `check_pending_instructions`，并 `poll_feedback` 上一个会话，防止漏掉迟到的回复。
+
 ⚠️ **重要提醒**:
 - **不要在args中添加`--debug`参数**，这会导致JSON解析失败
 - Cursor/Claude Desktop要求极其纯净的JSON输出
