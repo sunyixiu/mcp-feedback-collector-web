@@ -12,6 +12,8 @@ describe('配置管理', () => {
     delete process.env.MCP_DIALOG_TIMEOUT;
     delete process.env.MCP_API_BASE_URL;
     delete process.env.LOG_LEVEL;
+    delete process.env.MCP_ENABLE_CHAT;
+    delete process.env.MCP_ENABLE_IMAGE_TO_TEXT;
   });
 
   describe('createDefaultConfig', () => {

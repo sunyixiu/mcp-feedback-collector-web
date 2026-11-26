@@ -160,7 +160,7 @@ describe('图片处理器', () => {
   describe('processImages', () => {
     test('应该处理有效图片数组', async () => {
       // 创建一个简单的1x1像素PNG图片的Base64数据
-      const smallPngBase64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChAI9jU77yQAAAABJRU5ErkJggg==';
+      const smallPngBase64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4AWP4DwQACfsD/c8LaHIAAAAASUVORK5CYII=';
       
       const images: ImageData[] = [
         {

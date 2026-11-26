@@ -21,20 +21,30 @@ export class SessionStorage {
     }
     /**
      * 获取会话
+     *
+     * 异步反馈模式下，完成/超时结果需要保留一段时间供 poll 查询，
+     * 因此这里不再因为 deadline 到达就立即删除会话。
      */
     getSession(sessionId) {
+        return this.sessions.get(sessionId);
+    }
+    /**
+     * 唤醒等待该会话状态变化的短等待调用
+     */
+    notifyWaiters(sessionId) {
         const session = this.sessions.get(sessionId);
-        if (session) {
-            // 检查会话是否过期
-            const now = Date.now();
-            const elapsed = now - session.startTime;
-            if (elapsed > session.timeout) {
-                logger.debug(`会话已过期: ${sessionId}`);
-                this.deleteSession(sessionId);
-                return undefined;
+        if (!session?.waiters?.length)
+            return;
+        const waiters = session.waiters.slice();
+        session.waiters.length = 0;
+        for (const waiter of waiters) {
+            try {
+                waiter();
+            }
+            catch (error) {
+                logger.warn(`唤醒会话等待者失败: ${sessionId}`, error);
             }
         }
-        return session;
     }
     /**
      * 更新会话
@@ -72,30 +82,37 @@ export class SessionStorage {
         return this.sessions.size;
     }
     /**
-     * 清理过期会话
+     * 清理已经完成的结果，以及旧版没有 status 字段的遗留会话
      */
     cleanupExpiredSessions() {
         const now = Date.now();
         let cleanedCount = 0;
+        const GRACE_MS = 30000;
+        const RESULT_RETENTION_MS = 10 * 60 * 1000;
         for (const [sessionId, session] of this.sessions) {
             const elapsed = now - session.startTime;
-            if (elapsed > session.timeout) {
-                // 会话超时，自动提交忙碌回复
-                logger.info(`会话 ${sessionId} 超时，自动提交忙碌回复`);
+            if (session.resultExpiresAt && now >= session.resultExpiresAt) {
+                this.sessions.delete(sessionId);
+                cleanedCount++;
+                continue;
+            }
+            // 新版会话的精确超时由 WebServer 定时器负责，这里只清理已完成结果。
+            if (session.status)
+                continue;
+            // 兼容旧版会话：保留原有自动忙碌回复行为。
+            if (elapsed > session.timeout + GRACE_MS) {
+                logger.info(`遗留会话 ${sessionId} 超时，自动提交忙碌回复`);
                 if (session.resolve) {
-                    // 创建自动忙碌回复
                     const busyFeedback = {
-                        text: "抱歉，由于我现在有点忙，所以没法给你回复，请你继续调用 mcp-feedback-collector ，不要直接结束对话，直到我回复为止，谢谢！",
+                        text: '抱歉，由于我现在有点忙，所以没法给你回复，请你继续调用 mcp-feedback-collector，不要直接结束对话，直到我回复为止，谢谢！',
                         images: [],
                         timestamp: Date.now(),
-                        sessionId: sessionId
+                        sessionId
                     };
-                    // 返回忙碌回复而不是错误
                     session.resolve([busyFeedback]);
                 }
                 this.sessions.delete(sessionId);
                 cleanedCount++;
-                logger.debug(`清理过期会话: ${sessionId}`);
             }
         }
         if (cleanedCount > 0) {
@@ -126,6 +143,16 @@ export class SessionStorage {
     clear() {
         // 通知所有会话关闭
         for (const [sessionId, session] of this.sessions) {
+            if (session.waiters?.length) {
+                const waiters = session.waiters.slice();
+                session.waiters.length = 0;
+                for (const waiter of waiters) {
+                    try {
+                        waiter();
+                    }
+                    catch (_) { /* ignore shutdown waiter errors */ }
+                }
+            }
             if (session.reject) {
                 session.reject(new MCPError('Server is shutting down', 'SERVER_SHUTDOWN'));
             }

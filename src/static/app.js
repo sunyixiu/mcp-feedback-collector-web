@@ -23,17 +23,11 @@ let autoRefreshCountdown = 10;  // 改为10秒
 let autoRefreshTimer = null;
 let lastWorkSummary = null;  // 记录上次的工作汇报内容
 
-// 超时自动提交相关变量
-let sessionTimeoutId = null;
-let sessionStartTime = null;
+// 超时倒计时相关变量（仅作显示；权威计时与"用户在忙"自动代答已移到服务端，
+// 不再受浏览器后台标签页对 setTimeout/setInterval 的节流影响）
+let sessionDeadline = null;          // 服务端下发的绝对截止时间戳（ms）
 let sessionTimeoutDuration = 300000; // 默认5分钟，将从服务器获取
-let autoSubmitWarningShown = false;
-let timeoutWarningId = null;
-let countdownIntervalId = null; // 倒计时显示定时器
-
-// 熔断：连续超时计数（连续 N 次"用户在忙"后终止会话）
-let consecutiveTimeoutCount = 0;
-const MAX_CONSECUTIVE_TIMEOUTS = 5;
+let countdownIntervalId = null;      // 倒计时显示定时器
 
 // 空闲保活相关变量
 let lastActivityTime = Date.now();
@@ -515,12 +509,10 @@ function initializeSocket() {
             // 🔔 新反馈提醒（去重）
             _maybeRing(data.session_id, data.work_summary);
 
-            // 启动超时自动提交计时器
-            const timeoutToUse = data.timeout || sessionTimeoutDuration;
-            // 前端超时时间比后端超时时间提前2秒，确保能在后端超时前提交
-            const frontendTimeout = Math.max(timeoutToUse - 2000, timeoutToUse * 0.9);
-            console.log('使用的超时时间:', timeoutToUse, '前端超时时间:', frontendTimeout);
-            startSessionTimeout(frontendTimeout);
+            // 启动倒计时显示（服务端为权威计时，前端只展示）
+            const deadline = data.deadline || (Date.now() + (data.timeout || sessionTimeoutDuration));
+            console.log('服务端截止时间:', new Date(deadline).toLocaleTimeString());
+            startSessionCountdown(deadline);
 
             // 如果有工作汇报，显示它
             if (data.work_summary) {
@@ -539,13 +531,38 @@ function initializeSocket() {
     socket.on('keep_alive_ack', function(data) {
         if (data.success) {
             console.log('保活成功，会话超时已重置');
-            // 重置前端超时计时器
-            if (currentFeedbackSession && sessionTimeoutDuration) {
-                startSessionTimeout(sessionTimeoutDuration);
-            }
+            // 用服务端下发的新截止时间重置倒计时显示
+            const deadline = data.deadline || (Date.now() + sessionTimeoutDuration);
+            startSessionCountdown(deadline);
         } else {
             console.warn('保活失败:', data.message);
         }
+    });
+
+    // 服务端权威超时通知（自动代答/熔断已在服务端完成，这里只做提示）
+    socket.on('session_timed_out', function(data) {
+        console.log('服务端会话超时通知:', data);
+        if (data.session_id && data.session_id === currentFeedbackSession) {
+            currentFeedbackSession = null;
+        }
+        clearSessionTimeout();
+        clearAllStatusMessages();
+        if (data.fused) {
+            showStatusMessage('error', `🔌 连续超时 ${data.max} 次，服务端已熔断：通知 AI 终止会话。`, false);
+        } else {
+            showStatusMessage('info', `⏰ 会话超时 (${data.count}/${data.max})，服务端已自动代答"用户在忙"，AI 会重新调用 feedback。`, true);
+        }
+        try {
+            _playBeep(660, 0.25, 0.00);
+            _playBeep(990, 0.25, 0.30);
+            flashTitle(data.fused ? '🔌 会话已熔断' : '⏰ 会话已超时');
+            showSystemNotification(
+                data.fused ? '🔌 MCP 会话熔断' : '⏰ MCP 会话超时',
+                data.fused
+                    ? `连续 ${data.max} 次无响应，已通知 AI 终止会话。`
+                    : '服务端已代答"用户在忙"，AI 会重新调用 feedback 工具，请回来跟进。'
+            );
+        } catch (_) {}
     });
 
     // 处理无活跃会话的情况
@@ -570,8 +587,8 @@ function initializeSocket() {
                 if (data.session_id && data.session_id !== currentFeedbackSession) {
                     console.log(`session 切换: ${currentFeedbackSession} → ${data.session_id}`);
                     currentFeedbackSession = data.session_id;
-                    // 重置前端超时（用新会话默认 5 分钟，无 timeout 字段）
-                    startSessionTimeout(sessionTimeoutDuration);
+                    // 重置倒计时显示（优先用服务端下发的截止时间）
+                    startSessionCountdown(data.deadline || (Date.now() + sessionTimeoutDuration));
                 }
                 // 🔔 新反馈提醒（去重）
                 _maybeRing(data.session_id || currentFeedbackSession, data.work_summary);
@@ -720,22 +737,66 @@ function pasteImages() {
     });
 }
 
+// 客户端压缩：大图先缩放到最大边 MAX_DIM，再以 JPEG 重编码，避免 websocket 传输过大导致断连。
+function compressImageFile(file, maxDim = 1600, quality = 0.85) {
+    return new Promise((resolve) => {
+        // 小图（<300KB）直接原样返回，省去解码开销。
+        if (!file || !file.type || !file.type.startsWith('image/') || file.size <= 300 * 1024) {
+            const r = new FileReader();
+            r.onload = (e) => resolve({ data: e.target.result, size: file.size, type: file.type });
+            r.onerror = () => resolve(null);
+            r.readAsDataURL(file);
+            return;
+        }
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const img = new Image();
+            img.onload = () => {
+                let { width, height } = img;
+                const scale = Math.min(1, maxDim / Math.max(width, height));
+                width = Math.round(width * scale);
+                height = Math.round(height * scale);
+                try {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = width;
+                    canvas.height = height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, width, height);
+                    const out = canvas.toDataURL('image/jpeg', quality);
+                    const outSize = Math.round((out.length - out.indexOf(',') - 1) * 0.75);
+                    // 压缩没变小就用原图（例如本就很小的 PNG）
+                    if (outSize >= file.size) {
+                        resolve({ data: e.target.result, size: file.size, type: file.type });
+                    } else {
+                        resolve({ data: out, size: outSize, type: 'image/jpeg' });
+                    }
+                } catch (err) {
+                    resolve({ data: e.target.result, size: file.size, type: file.type });
+                }
+            };
+            img.onerror = () => resolve({ data: e.target.result, size: file.size, type: file.type });
+            img.src = e.target.result;
+        };
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(file);
+    });
+}
+
 function addImage(file) {
-    const reader = new FileReader();
-    reader.onload = function(e) {
+    compressImageFile(file).then((res) => {
+        if (!res) return;
         const imageData = {
             file: file,
-            data: e.target.result,
+            data: res.data,
             name: file.name,
-            size: file.size,
-            type: file.type,
+            size: res.size,
+            type: res.type,
             id: Date.now() + Math.random()
         };
 
         selectedImages.push(imageData);
         updateImagePreviews();
-    };
-    reader.readAsDataURL(file);
+    });
 }
 
 function updateImagePreviews() {
@@ -857,25 +918,16 @@ const QUICK_PHRASE = `
 
 ---
 
-Whenever you want to ask a question, always call the MCP .
+Whenever you want to ask a question, use the MCP feedback tools.
 
-Whenever you are about to complete a user request, call the MCP instead of simply ending the process. Keep calling MCP until the users feedback is empty, then end the request. mcp-feedback-collector.collect_feedback
+Before completing a user request:
+1. Call check_pending_instructions first and process every returned instruction in FIFO order.
+2. Call collect_feedback once with work_summary. It returns a session_id immediately.
+3. Call wait_feedback with that session_id for at most 45 seconds per call.
+4. If the status is still waiting, call wait_feedback again later or use poll_feedback for an immediate check.
+5. Stop only when the feedback session returns completed, timed_out, cancelled, or an unrecoverable error.
 
-**Workflow before ending each turn:**
-1. Call \`check_pending_instructions\` first — if instructions exist, process them in FIFO order before collecting feedback.
-2. Only call \`collect_feedback\` when \`check_pending_instructions\` returns an empty list.
-3. Keep calling \`collect_feedback\` until the user feedback is empty, then end the request.
-
-**How to call (MCP tool):**
-- Server priority (try in order): \`project-0-booking-theoryabc-mcp-feedback-collector\` → \`user-mcp-feedback-collector-stdio\` → \`user-mcp-feedback-collector-backup\`
-- Tool: \`collect_feedback\` with argument \`{ "work_summary": "<your summary>" }\`
-- Tool: \`check_pending_instructions\` with no arguments
-- If a server returns "Not connected" or "tool not found", try the next server.
-
-**Inserting temporary instructions:**
-- Users can insert out-of-band instructions at any time via the feedback web UI.
-- The agent MUST call \`check_pending_instructions\` before \`collect_feedback\` to pick these up.
-- This saves communication time by allowing async task injection.`;
+Do not call collect_feedback repeatedly for the same work summary while the previous session is still waiting.`;
 
 // 提交反馈
 document.getElementById('feedback-form').addEventListener('submit', function(e) {
@@ -1019,9 +1071,7 @@ function hideSubmitConfirmDialog() {
 
 // 实际提交反馈的函数
 function submitFeedback(feedbackText, shouldCloseAfterSubmit) {
-    // 用户手动提交 → 重置熔断计数
-    consecutiveTimeoutCount = 0;
-    // 清除超时计时器（用户已手动提交）
+    // 清除倒计时显示（服务端收到真实反馈后会重置熔断计数）
     clearSessionTimeout();
 
     // 禁用提交按钮
@@ -1625,139 +1675,42 @@ function updateVersionDisplay(version) {
     }
 }
 
-// ==================== 超时自动提交功能 ====================
+// ==================== 超时倒计时（仅显示） ====================
+// 权威计时在服务端：到点由服务端自动代答"用户在忙"并做熔断计数。
+// 前端只根据服务端下发的绝对截止时间戳渲染倒计时，即使标签页被节流，
+// 恢复前台后一算 deadline - now 也立即显示正确剩余时间。
 
 /**
- * 启动会话超时计时器
- * @param {number} timeoutMs 超时时间（毫秒）
+ * 启动会话倒计时显示
+ * @param {number} deadline 服务端下发的绝对截止时间戳（毫秒）
  */
-function startSessionTimeout(timeoutMs) {
-    // 清除之前的计时器
+function startSessionCountdown(deadline) {
     clearSessionTimeout();
-
-    sessionStartTime = Date.now();
-    sessionTimeoutDuration = timeoutMs;
-    autoSubmitWarningShown = false;
-
-    console.log(`启动会话超时计时器: ${timeoutMs}ms (${timeoutMs/1000}秒)`);
-
-    // 启动倒计时显示
+    sessionDeadline = deadline;
+    console.log(`启动倒计时显示，截止: ${new Date(deadline).toLocaleTimeString()}`);
     startCountdownDisplay();
-
-    // 在超时前5秒显示警告
-    const warningTime = Math.max(timeoutMs - 5000, timeoutMs * 0.9); // 至少在90%时间后警告
-    timeoutWarningId = setTimeout(() => {
-        showTimeoutWarning();
-    }, warningTime);
-
-    // 设置前端超时计时器（只关闭页面，不提交反馈）
-    sessionTimeoutId = setTimeout(() => {
-        handleFrontendTimeout();
-    }, timeoutMs);
 }
 
 /**
- * 清除会话超时计时器
+ * 清除会话倒计时显示
  */
 function clearSessionTimeout() {
-    if (sessionTimeoutId) {
-        clearTimeout(sessionTimeoutId);
-        sessionTimeoutId = null;
-    }
-    if (timeoutWarningId) {
-        clearTimeout(timeoutWarningId);
-        timeoutWarningId = null;
-    }
+    sessionDeadline = null;
     if (countdownIntervalId) {
         clearInterval(countdownIntervalId);
         countdownIntervalId = null;
     }
-    autoSubmitWarningShown = false;
-
-    // 隐藏倒计时显示
     hideCountdownDisplay();
 }
 
 /**
- * 显示超时警告
- */
-function showTimeoutWarning() {
-    if (autoSubmitWarningShown) return;
-
-    autoSubmitWarningShown = true;
-    const remainingTime = Math.max(0, Math.ceil((sessionTimeoutDuration - (Date.now() - sessionStartTime)) / 1000));
-
-    showStatusMessage('warning', `⏰ 会话即将在 ${remainingTime} 秒后超时，如未提交反馈将自动提交忙碌回复`, false);
-    console.log(`显示超时警告，剩余时间: ${remainingTime}秒`);
-}
-
-/**
- * 前端会话超时处理 - 自动提交"等待用户"消息，保持通话不中断
- * 熔断机制：连续超时达到 MAX_CONSECUTIVE_TIMEOUTS 次后，发送终止信号
- */
-function handleFrontendTimeout() {
-    if (!currentFeedbackSession) {
-        console.log('无活跃会话，跳过前端超时处理');
-        return;
-    }
-
-    consecutiveTimeoutCount++;
-    console.log(`前端会话超时 (连续第 ${consecutiveTimeoutCount}/${MAX_CONSECUTIVE_TIMEOUTS} 次)`);
-
-    clearAllStatusMessages();
-
-    const isFused = consecutiveTimeoutCount >= MAX_CONSECUTIVE_TIMEOUTS;
-    const busyMessage = isFused
-        ? '用户长时间未响应，任务结束。请终止会话，不要再调用 feedback 工具。'
-        : `用户在忙（第${consecutiveTimeoutCount}/${MAX_CONSECUTIVE_TIMEOUTS}次），请继续调用 feedback 工具。`;
-
-    const feedbackData = {
-        text: busyMessage,
-        images: [],
-        timestamp: Date.now(),
-        sessionId: currentFeedbackSession,
-        shouldCloseAfterSubmit: isFused,
-    };
-
-    if (isConnected && socket) {
-        socket.emit('submit_feedback', feedbackData);
-        if (isFused) {
-            showStatusMessage('error', `🔌 连续超时 ${MAX_CONSECUTIVE_TIMEOUTS} 次，已触发熔断：通知 AI 终止会话。`, false);
-            console.log('熔断触发：已发送终止信号');
-        } else {
-            showStatusMessage('info', `⏰ 会话超时 (${consecutiveTimeoutCount}/${MAX_CONSECUTIVE_TIMEOUTS})，已自动回复：${busyMessage}`, true);
-            console.log('超时自动提交忙碌回复完成');
-        }
-        try {
-            _playBeep(660, 0.25, 0.00);
-            _playBeep(990, 0.25, 0.30);
-            flashTitle(isFused ? '🔌 会话已熔断' : '⏰ 会话已超时');
-            showSystemNotification(
-                isFused ? '🔌 MCP 会话熔断' : '⏰ MCP 会话超时',
-                isFused
-                    ? `连续 ${MAX_CONSECUTIVE_TIMEOUTS} 次无响应，已通知 AI 终止会话。`
-                    : '已代答"用户在忙"，AI 会重新调用 feedback 工具，请回来跟进。'
-            );
-        } catch (_) {}
-    } else {
-        showStatusMessage('error', '⏰ 会话超时，但连接已断开，无法自动提交。', false);
-    }
-
-    if (isFused) {
-        consecutiveTimeoutCount = 0;
-    }
-
-    clearSessionTimeout();
-}
-
-/**
- * 获取剩余时间（秒）
+ * 获取剩余时间（秒），基于服务端截止时间戳
  */
 function getRemainingTime() {
-    if (!sessionStartTime || !sessionTimeoutDuration) {
+    if (!sessionDeadline) {
         return 0;
     }
-    return Math.max(0, Math.ceil((sessionTimeoutDuration - (Date.now() - sessionStartTime)) / 1000));
+    return Math.max(0, Math.ceil((sessionDeadline - Date.now()) / 1000));
 }
 
 // ==================== 倒计时显示功能 ====================

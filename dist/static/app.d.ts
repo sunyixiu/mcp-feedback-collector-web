@@ -19,6 +19,7 @@ declare function showTab(tabName: any): void;
 declare function switchTab(tabName: any): void;
 declare function selectImages(): void;
 declare function pasteImages(): void;
+declare function compressImageFile(file: any, maxDim?: number, quality?: number): Promise<any>;
 declare function addImage(file: any): void;
 declare function updateImagePreviews(): void;
 declare function removeImage(index: any): void;
@@ -71,25 +72,16 @@ declare function clearChatMessages(): void;
 declare function fetchVersionInfo(): Promise<void>;
 declare function updateVersionDisplay(version: any): void;
 /**
- * 启动会话超时计时器
- * @param {number} timeoutMs 超时时间（毫秒）
+ * 启动会话倒计时显示
+ * @param {number} deadline 服务端下发的绝对截止时间戳（毫秒）
  */
-declare function startSessionTimeout(timeoutMs: number): void;
+declare function startSessionCountdown(deadline: number): void;
 /**
- * 清除会话超时计时器
+ * 清除会话倒计时显示
  */
 declare function clearSessionTimeout(): void;
 /**
- * 显示超时警告
- */
-declare function showTimeoutWarning(): void;
-/**
- * 前端会话超时处理 - 自动提交"等待用户"消息，保持通话不中断
- * 熔断机制：连续超时达到 MAX_CONSECUTIVE_TIMEOUTS 次后，发送终止信号
- */
-declare function handleFrontendTimeout(): void;
-/**
- * 获取剩余时间（秒）
+ * 获取剩余时间（秒），基于服务端截止时间戳
  */
 declare function getRemainingTime(): number;
 /**
@@ -128,6 +120,25 @@ declare function cancelPending(id: any): Promise<void>;
 declare function clearPending(): Promise<void>;
 declare function setPendingError(msg: any): void;
 declare function escapeHtml(s: any): string;
+declare function _draftsLoad(): any[];
+declare function _draftsSave(arr: any): void;
+declare function _draftsGenId(): string;
+/**
+ * 实时保存当前草稿（debounce）
+ * - 文本为空 + 草稿状态为 editing → 删除该草稿（避免空记录）
+ * - 文本非空 → 更新或插入
+ */
+declare function saveCurrentDraft(text: any): void;
+/**
+ * 标记当前正在编辑的草稿为某种状态
+ * 提交开始时不立即标记；提交成功才标 sent；提交失败/超时标 failed。
+ */
+declare function markCurrentDraft(status: any): void;
+declare function deleteDraft(id: any): void;
+declare function clearAllDrafts(): void;
+declare function restoreDraft(id: any): void;
+declare function renderDraftsList(): void;
+declare function initDraftsUI(): void;
 /**
  * MCP Feedback Collector - 前端应用脚本
  */
@@ -146,18 +157,18 @@ declare let autoRefreshInterval: null;
 declare let autoRefreshCountdown: number;
 declare let autoRefreshTimer: null;
 declare let lastWorkSummary: null;
-declare let sessionTimeoutId: null;
-declare let sessionStartTime: null;
+declare let sessionDeadline: null;
 declare let sessionTimeoutDuration: number;
-declare let autoSubmitWarningShown: boolean;
-declare let timeoutWarningId: null;
 declare let countdownIntervalId: null;
-declare let consecutiveTimeoutCount: number;
-declare const MAX_CONSECUTIVE_TIMEOUTS: 5;
 declare let lastActivityTime: number;
 declare let keepAliveCheckInterval: null;
 declare const KEEP_ALIVE_IDLE_MS: 180000;
 declare const KEEP_ALIVE_CHECK_MS: 30000;
+declare const DRAFTS_KEY: "mcp_feedback_drafts_v1";
+declare const DRAFTS_MAX: 10;
+declare const DRAFT_DEBOUNCE_MS: 300;
+declare let _currentDraftId: null;
+declare let _draftSaveTimer: null;
 declare let _audioCtx: null;
 declare let _titleFlashInterval: null;
 declare let _originalTitle: null;
@@ -166,7 +177,7 @@ declare let _lastRingSummaryHash: null;
 declare let _backgroundRingInterval: null;
 declare const NOTIFY_SOUND_KEY: "mcp_notify_sound_enabled";
 declare const BACKGROUND_RING_INTERVAL_MS: 25000;
-declare const QUICK_PHRASE: "\n\n---\n\nWhenever you want to ask a question, always call the MCP .\n\nWhenever you are about to complete a user request, call the MCP instead of simply ending the process. Keep calling MCP until the users feedback is empty, then end the request. mcp-feedback-collector.collect_feedback\n\n**Workflow before ending each turn:**\n1. Call `check_pending_instructions` first \u2014 if instructions exist, process them in FIFO order before collecting feedback.\n2. Only call `collect_feedback` when `check_pending_instructions` returns an empty list.\n3. Keep calling `collect_feedback` until the user feedback is empty, then end the request.\n\n**How to call (MCP tool):**\n- Server priority (try in order): `project-0-booking-theoryabc-mcp-feedback-collector` \u2192 `user-mcp-feedback-collector-stdio` \u2192 `user-mcp-feedback-collector-backup`\n- Tool: `collect_feedback` with argument `{ \"work_summary\": \"<your summary>\" }`\n- Tool: `check_pending_instructions` with no arguments\n- If a server returns \"Not connected\" or \"tool not found\", try the next server.\n\n**Inserting temporary instructions:**\n- Users can insert out-of-band instructions at any time via the feedback web UI.\n- The agent MUST call `check_pending_instructions` before `collect_feedback` to pick these up.\n- This saves communication time by allowing async task injection.";
+declare const QUICK_PHRASE: "\n\n---\n\nWhenever you want to ask a question, use the MCP feedback tools.\n\nBefore completing a user request:\n1. Call check_pending_instructions first and process every returned instruction in FIFO order.\n2. Call collect_feedback once with work_summary. It returns a session_id immediately.\n3. Call wait_feedback with that session_id for at most 45 seconds per call.\n4. If the status is still waiting, call wait_feedback again later or use poll_feedback for an immediate check.\n5. Stop only when the feedback session returns completed, timed_out, cancelled, or an unrecoverable error.\n\nDo not call collect_feedback repeatedly for the same work summary while the previous session is still waiting.";
 declare const PENDING_API: "/api/pending-instructions";
 declare let pendingPollTimer: null;
 //# sourceMappingURL=app.d.ts.map

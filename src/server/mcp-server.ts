@@ -5,19 +5,34 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { CallToolResult, TextContent, ImageContent, SetLevelRequestSchema, LoggingMessageNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolResult, TextContent, ImageContent, SetLevelRequestSchema, LoggingMessageNotificationSchema, ProgressToken } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { IncomingMessage, ServerResponse } from 'http';
-import { Config, CollectFeedbackParams, MCPError, FeedbackData, ImageData, MCPLogLevel, MCPLogMessage } from '../types/index.js';
+import { Config, FeedbackData, FeedbackSessionSnapshot, ImageData, MCPError, MCPLogLevel, MCPLogMessage } from '../types/index.js';
 import { logger } from '../utils/logger.js';
 import { WebServer } from './web-server.js';
 import { PendingInstructionStore } from '../utils/pending-instruction-store.js';
 
 // 心跳间隔（毫秒）。用 ping 请求（双向）替代 log notification，Cursor V2 FSM 只认 client/server 双向流量
-const HEARTBEAT_INTERVAL_MS = 20000;
-// 心跳连续失败多少次后标记连接异常
-const HEARTBEAT_MAX_FAILURES = 3;
+const HEARTBEAT_INTERVAL_MS = 30000;
+// 心跳连续失败多少次后销毁会话。
+// 2026-07-03 调整 3 → 20（约 10 分钟容忍）：Cursor 客户端在跑重活（本地批量 TTS、大文件打包等）时
+// 会几分钟不回 ping，旧阈值 3 次(约1分钟)就把会话杀了，导致用户正在 feedback 窗口打字时对话突然中断，
+// 必须手动关开 MCP 才能重连。会话本身占用极小，宁可长时间保留也不要误杀活会话。
+const HEARTBEAT_MAX_FAILURES = 20;
+
+/**
+ * HTTP 模式下的单个客户端会话
+ * 每个 Cursor 窗口 initialize 时创建一个，互不干扰
+ */
+interface HttpSession {
+  server: McpServer;
+  transport: StreamableHTTPServerTransport;
+  heartbeatTimer: ReturnType<typeof setInterval> | null;
+  heartbeatFailures: number;
+  createdAt: number;
+}
 
 /**
  * MCP服务器类
@@ -27,36 +42,55 @@ export class MCPServer {
   private webServer: WebServer;
   private config: Config;
   private isRunning = false;
+  private isMcpRunning = false;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private heartbeatFailures = 0;
-  private httpTransport: StreamableHTTPServerTransport | null = null;
+  private httpSessions = new Map<string, HttpSession>();
   private transportMode: 'stdio' | 'http' = 'stdio';
 
   constructor(config: Config) {
     this.config = config;
 
-    // 创建MCP服务器实例
-    this.mcpServer = new McpServer({
-      name: 'mcp-feedback-collector',
-      version: '2.1.3'
-    }, {
-      capabilities: {
-        tools: {},
-        logging: {} // 添加日志功能支持
-      }
-    });
-
-    // 设置初始化完成回调
-    this.mcpServer.server.oninitialized = () => {
-      logger.info('MCP初始化完成');
-    };
+    // stdio 模式使用的默认实例（HTTP 模式下每个会话有自己的实例）
+    this.mcpServer = this.createServerInstance();
 
     // 创建Web服务器实例
     this.webServer = new WebServer(config);
 
-    // 注册MCP工具函数和日志处理
-    this.registerTools();
+    // 设置全局日志回调（广播到所有活跃会话）
     this.setupLogging();
+  }
+
+  /**
+   * 创建一个完整的 McpServer 实例（含工具注册和日志处理）
+   * HTTP 多会话模式下每个客户端会话独享一个实例
+   */
+  private createServerInstance(): McpServer {
+    const server = new McpServer({
+      name: 'mcp-feedback-collector',
+      version: '2.2.0'
+    }, {
+      capabilities: {
+        tools: {},
+        logging: {}
+      }
+    });
+
+    server.server.oninitialized = () => {
+      logger.info('MCP初始化完成');
+    };
+
+    this.registerTools(server);
+
+    // 处理日志级别设置请求（每个实例都要注册）
+    server.server.setRequestHandler(SetLevelRequestSchema, async (request) => {
+      const level = request.params.level as MCPLogLevel;
+      logger.setMCPLogLevel(level);
+      logger.info(`MCP日志级别已设置为: ${level}`);
+      return {};
+    });
+
+    return server;
   }
 
   /**
@@ -118,11 +152,15 @@ export class MCPServer {
   /**
    * 注册MCP工具函数
    */
-  private registerTools(): void {
-    this.mcpServer.registerTool(
+  private registerTools(mcpServer: McpServer): void {
+    // ========== 异步反馈句柄 ==========
+    mcpServer.registerTool(
       'collect_feedback',
       {
-        description: 'Collect feedback from users about AI work summary. Call this tool with parameter "work_summary" (string). Also accepts: summary, message, content, text, description, report, feedback, etc.',
+        description:
+          'Create a feedback session and return immediately. The result contains session_id. ' +
+          `After this tool returns, call wait_feedback with that session_id (max ${WebServer.MAX_WAIT_SECONDS} seconds per call), ` +
+          'then poll_feedback if needed. Do not call collect_feedback repeatedly for the same session.',
         inputSchema: {
           work_summary: z.string().optional().describe('AI工作汇报内容，描述AI完成的工作和结果'),
           summary: z.string().optional().describe('Alias for work_summary'),
@@ -133,35 +171,66 @@ export class MCPServer {
           description: z.string().optional().describe('Alias for work_summary'),
           report: z.string().optional().describe('Alias for work_summary'),
           question: z.string().optional().describe('Alias for work_summary'),
-          prompt: z.string().optional().describe('Alias for work_summary'),
+          prompt: z.string().optional().describe('Alias for work_summary')
         }
       },
       async (args: Record<string, unknown>): Promise<CallToolResult> => {
-        const resolvedSummary = this.extractWorkSummary(args);
-
-        const params: CollectFeedbackParams = {
-          work_summary: resolvedSummary
+        const workSummary = this.extractWorkSummary(args);
+        const timeoutSeconds = this.config.dialogTimeout;
+        await this.ensureWebServer();
+        const session = await this.webServer.createFeedbackSession(workSummary, timeoutSeconds);
+        logger.mcp('collect_feedback', { work_summary: workSummary, session_id: session.session_id }, session);
+        return {
+          content: [{
+            type: 'text',
+            text: [
+              '反馈会话已创建，MCP 请求已立即返回。',
+              `session_id: ${session.session_id}`,
+              'status: waiting',
+              `反馈页面: ${this.getFeedbackUrlFromSnapshot(session)}`,
+              `下一步：调用 wait_feedback({ session_id, wait_seconds: ${WebServer.MAX_WAIT_SECONDS} })；若仍为 waiting，再调用 wait_feedback 或 poll_feedback。`
+            ].join('\n')
+          }],
+          isError: false
         };
+      }
+    );
 
-        logger.mcp('collect_feedback', params);
-
-        try {
-          const result = await this.collectFeedback(params);
-          logger.mcp('collect_feedback', params, result);
-          return result;
-        } catch (error) {
-          logger.error('collect_feedback工具调用失败:', error);
-
-          if (error instanceof MCPError) {
-            throw error;
-          }
-
-          throw new MCPError(
-            'Failed to collect feedback',
-            'COLLECT_FEEDBACK_ERROR',
-            error
-          );
+    mcpServer.registerTool(
+      'wait_feedback',
+      {
+        description:
+          `Wait briefly for a feedback session. Each call lasts at most ${WebServer.MAX_WAIT_SECONDS} seconds. ` +
+          'Use the session_id returned by collect_feedback. If status is waiting, call again later.',
+        inputSchema: {
+          session_id: z.string().min(1).describe('collect_feedback返回的session_id'),
+          wait_seconds: z.number().int().min(1).max(WebServer.MAX_WAIT_SECONDS).optional().describe(`本次最多等待秒数，默认${WebServer.MAX_WAIT_SECONDS}秒`)
         }
+      },
+      async (args: Record<string, unknown>): Promise<CallToolResult> => {
+        const sessionId = typeof args['session_id'] === 'string' ? args['session_id'] : '';
+        const waitSeconds = typeof args['wait_seconds'] === 'number' ? args['wait_seconds'] : WebServer.MAX_WAIT_SECONDS;
+        await this.ensureWebServer();
+        const result = await this.webServer.waitForFeedback(sessionId, waitSeconds);
+        return this.formatFeedbackSessionResult(result);
+      }
+    );
+
+    mcpServer.registerTool(
+      'poll_feedback',
+      {
+        description:
+          'Immediately query a feedback session without waiting. Use after wait_feedback returns waiting, ' +
+          'or to recover a result after a client reconnects.',
+        inputSchema: {
+          session_id: z.string().min(1).describe('collect_feedback返回的session_id')
+        }
+      },
+      async (args: Record<string, unknown>): Promise<CallToolResult> => {
+        const sessionId = typeof args['session_id'] === 'string' ? args['session_id'] : '';
+        await this.ensureWebServer();
+        const result = this.webServer.pollFeedback(sessionId);
+        return this.formatFeedbackSessionResult(result);
       }
     );
 
@@ -170,7 +239,7 @@ export class MCPServer {
     // agent 工作流：
     //   每次 collect_feedback 之前先调这个，
     //   返回非空 → 先把这些指令做掉再调本工具直到空 → 再 collect_feedback
-    this.mcpServer.registerTool(
+    mcpServer.registerTool(
       'check_pending_instructions',
       {
         description:
@@ -217,23 +286,13 @@ export class MCPServer {
   }
 
   /**
-   * 设置MCP日志功能
+   * 设置MCP日志功能（全局回调，只设置一次）
    */
   private setupLogging(): void {
-    // 设置MCP日志回调
     logger.setMCPLogCallback((message: MCPLogMessage) => {
       this.sendLogNotification(message).catch(() => {
         // 静默处理错误，避免未处理的Promise拒绝
       });
-    });
-
-    // 处理日志级别设置请求
-    this.mcpServer.server.setRequestHandler(SetLevelRequestSchema, async (request) => {
-      const level = request.params.level as MCPLogLevel;
-      logger.setMCPLogLevel(level);
-      logger.info(`MCP日志级别已设置为: ${level}`);
-
-      return {}; // 返回空结果表示成功
     });
 
     logger.info('MCP日志功能已设置');
@@ -241,70 +300,75 @@ export class MCPServer {
 
   /**
    * 发送MCP日志通知
+   * stdio 模式发给默认实例；HTTP 模式广播给所有活跃会话
    */
   private async sendLogNotification(message: MCPLogMessage): Promise<void> {
-    try {
-      await this.mcpServer.server.notification({
-        method: 'notifications/message',
-        params: {
-          level: message.level,
-          logger: message.logger,
-          data: message.data
-        }
-      });
-    } catch (error) {
-      // 避免日志通知错误导致程序崩溃，但不要输出到控制台避免污染MCP输出
-      // console.error('发送MCP日志通知失败:', error);
+    const payload = {
+      method: 'notifications/message' as const,
+      params: {
+        level: message.level,
+        logger: message.logger,
+        data: message.data
+      }
+    };
+
+    const targets: McpServer[] = this.transportMode === 'http'
+      ? [...this.httpSessions.values()].map(s => s.server)
+      : [this.mcpServer];
+
+    for (const server of targets) {
+      try {
+        await server.server.notification(payload);
+      } catch {
+        // 单个会话通知失败不影响其他会话
+      }
     }
   }
 
-  /**
-   * 实现collect_feedback功能
-   */
-  private async collectFeedback(params: CollectFeedbackParams): Promise<CallToolResult> {
-    const { work_summary } = params;
-    const timeout_seconds = this.config.dialogTimeout;
+  private async ensureWebServer(): Promise<void> {
+    if (!this.webServer.isRunning()) {
+      await this.webServer.start();
+    }
+  }
 
-    logger.info(`开始收集反馈，工作汇报长度: ${work_summary.length}字符，超时: ${timeout_seconds}秒`);
+  private getFeedbackUrlFromSnapshot(snapshot: FeedbackSessionSnapshot): string {
+    return snapshot.feedback_url
+      || this.config.serverBaseUrl
+      || `http://${this.config.serverHost || 'localhost'}:${this.webServer.getPort()}`;
+  }
 
-    // 发送MCP工具调用开始通知
-    logger.mcpToolCallStarted('collect_feedback', {
-      work_summary_length: work_summary.length,
-      timeout_seconds: timeout_seconds
-    });
+  private formatFeedbackSessionResult(result: FeedbackSessionSnapshot): CallToolResult {
+    if (result.status === 'completed' || result.status === 'timed_out') {
+      const content = this.formatFeedbackForMCP(result.feedback || []);
+      content.unshift({
+        type: 'text',
+        text: `反馈会话 ${result.session_id} 状态: ${result.status}`
+      });
+      return { content, isError: false };
+    }
 
-    try {
-      // 启动Web服务器（如果未运行）
-      if (!this.webServer.isRunning()) {
-        await this.webServer.start();
-      }
-
-      // 收集用户反馈
-      const feedback = await this.webServer.collectFeedback(work_summary, timeout_seconds);
-
-      logger.info(`反馈收集完成，收到 ${feedback.length} 条反馈`);
-
-      // 格式化反馈数据为MCP内容（支持图片）
-      const content = this.formatFeedbackForMCP(feedback);
-
-      return {
-        content,
-        isError: false
-      };
-
-    } catch (error) {
-      logger.error('反馈收集失败:', error);
-
-      const errorMessage = error instanceof MCPError ? error.message : 'Failed to collect user feedback';
-
+    if (result.status === 'not_found' || result.status === 'error' || result.status === 'cancelled') {
       return {
         content: [{
           type: 'text',
-          text: `错误: ${errorMessage}`
+          text: `反馈会话 ${result.session_id} 状态: ${result.status}。${result.message || ''}`.trim()
         }],
-        isError: true
+        isError: result.status === 'not_found' || result.status === 'error'
       };
     }
+
+    return {
+      content: [{
+        type: 'text',
+        text: [
+          `反馈会话 ${result.session_id} 仍在等待用户回复。`,
+          'status: waiting',
+          `remaining_seconds: ${result.remaining_seconds ?? 0}`,
+          '请稍后再次调用 wait_feedback，或使用 poll_feedback 立即查询。'
+        ].join('\n')
+      }],
+      isError: false
+    };
   }
 
   /**
@@ -444,10 +508,13 @@ export class MCPServer {
       }
 
       this.isRunning = true;
+      this.isMcpRunning = true;
       logger.info('MCP服务器启动成功');
 
-      // 启动心跳保活（stdio 和 http 都需要）
-      this.startHeartbeat();
+      // 全局心跳仅 stdio 模式需要；HTTP 模式改为每会话独立心跳
+      if (this.transportMode === 'stdio') {
+        this.startHeartbeat();
+      }
 
     } catch (error) {
       logger.error('MCP服务器启动失败:', error);
@@ -472,6 +539,7 @@ export class MCPServer {
     transport.onclose = () => {
       logger.info('MCP stdio 传输连接已关闭');
       this.isRunning = false;
+      this.isMcpRunning = false;
       this.stopHeartbeat();
     };
 
@@ -500,97 +568,156 @@ export class MCPServer {
    * 启动 HTTP/SSE 模式（独立进程，Cursor 通过 url 连接）
    * 使用 Streamable HTTP transport，支持 SSE 流式推送
    *
-   * 关键设计：
-   * - 单 Cursor 客户端场景，同一时刻只保留一条 transport
-   * - Cursor 重启会发新 `initialize` 但不带旧 session id，必须主动重建 transport
-   * - 否则旧 transport 会以 "Server already initialized" 拒绝新客户端
+   * 多会话设计（v2.1.4）：
+   * - 按 mcp-session-id 维护 transport map，每个 Cursor 窗口一个独立会话
+   * - 新客户端 initialize 只新建自己的会话，不再拆掉别人的 transport
+   *   （旧版单 transport 设计会导致：窗口 A 正挂着 collect_feedback 等用户反馈时，
+   *    窗口 B 的 initialize 把通道拆了，A 的结果永远回不去）
+   * - 每个会话独立心跳，连续失败则只销毁该会话
    */
   private async startHttpMode(): Promise<void> {
     // 先启动 webServer，因为 /mcp 路由要挂在它上面
     await this.webServer.start();
 
-    await this.buildHttpTransport();
-
     // 把 /mcp 路由挂到 webServer 上
     this.webServer.attachMcpTransport(async (req: IncomingMessage, res: ServerResponse, parsedBody?: unknown) => {
-      // 判断是否是「新客户端的 initialize」：method=initialize 且请求头无 mcp-session-id
-      // —— 这种情况下必须抛弃旧 transport 重建，否则 SDK 会返回 "Server already initialized"
       const body = parsedBody as { method?: string; jsonrpc?: string } | undefined;
-      const method = body?.method;
-      const hasSessionHeader = !!req.headers['mcp-session-id'];
-      const currentSessionId = this.httpTransport?.sessionId;
+      const sessionIdHeader = req.headers['mcp-session-id'] as string | undefined;
 
-      if (method === 'initialize' && !hasSessionHeader && currentSessionId) {
-        logger.info(`检测到新客户端 initialize（旧 session=${currentSessionId}），重建 HTTP transport`);
-        try {
-          await this.buildHttpTransport();
-        } catch (e) {
-          logger.error('重建 HTTP transport 失败:', e);
-        }
-      }
-
-      if (!this.httpTransport) {
-        try {
-          await this.buildHttpTransport();
-        } catch (e) {
-          logger.error('懒加载 HTTP transport 失败:', e);
-          res.statusCode = 503;
-          res.end('MCP transport not initialized');
+      // 1) 带 session id 的请求 → 路由到对应会话
+      if (sessionIdHeader) {
+        const session = this.httpSessions.get(sessionIdHeader);
+        if (session) {
+          await session.transport.handleRequest(req, res, parsedBody);
           return;
         }
+        // 未知/已过期的 session → 404，让客户端按规范重新 initialize
+        res.statusCode = 404;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          error: { code: -32001, message: 'Session not found' },
+          id: null
+        }));
+        return;
       }
-      await this.httpTransport!.handleRequest(req, res, parsedBody);
+
+      // 2) 无 session id 且是 initialize → 新建会话
+      if (body?.method === 'initialize') {
+        try {
+          await this.createHttpSession(req, res, parsedBody);
+        } catch (e) {
+          logger.error('创建 HTTP 会话失败:', e);
+          if (!res.headersSent) {
+            res.statusCode = 500;
+            res.end('Failed to create MCP session');
+          }
+        }
+        return;
+      }
+
+      // 3) 其他无 session 请求 → 400
+      res.statusCode = 400;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Bad Request: missing mcp-session-id' },
+        id: null
+      }));
     });
+
+    logger.info('HTTP 多会话模式已就绪（等待客户端 initialize）');
   }
 
   /**
-   * 建立或重建 HTTP transport
-   *
-   * 安全拆除旧 transport + 关闭旧 server 绑定 → 新建 transport → 重新 connect
-   * 工具处理器注册在 McpServer 层，Server.close() 只清 _transport 不清 handlers，重连后继续可用
+   * 为一个新客户端建立独立会话（独享 McpServer 实例 + transport + 心跳）
    */
-  private async buildHttpTransport(): Promise<void> {
-    // 1) 拆旧 transport
-    if (this.httpTransport) {
-      try {
-        await this.httpTransport.close();
-      } catch (e) {
-        logger.warn('关闭旧 httpTransport 出错:', e);
-      }
-      this.httpTransport = null;
-    }
+  private async createHttpSession(req: IncomingMessage, res: ServerResponse, parsedBody?: unknown): Promise<void> {
+    const server = this.createServerInstance();
 
-    // 2) 拆旧 mcpServer-transport 绑定（使 connect 可再次调用）
-    try {
-      await this.mcpServer.server.close();
-    } catch (e) {
-      logger.warn('关闭旧 server 绑定出错:', e);
-    }
-
-    // 3) 停心跳
-    this.stopHeartbeat();
-
-    // 4) 建新
-    this.httpTransport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-    });
-
-    this.httpTransport.onerror = (error: Error) => {
-      logger.error('MCP HTTP 传输错误:', error);
+    const session: HttpSession = {
+      server,
+      transport: null as unknown as StreamableHTTPServerTransport,
+      heartbeatTimer: null,
+      heartbeatFailures: 0,
+      createdAt: Date.now()
     };
 
-    this.httpTransport.onclose = () => {
-      logger.info('MCP HTTP 传输连接已关闭');
-      // HTTP 模式下不立即停止服务，保持常驻等 Cursor 重连
-      this.stopHeartbeat();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (sessionId: string) => {
+        this.httpSessions.set(sessionId, session);
+        this.startSessionHeartbeat(sessionId, session);
+        logger.info(`新 MCP 会话已建立: ${sessionId}（当前并发会话数: ${this.httpSessions.size}）`);
+      }
+    });
+    session.transport = transport;
+
+    transport.onerror = (error: Error) => {
+      logger.error(`MCP HTTP 传输错误 (session=${transport.sessionId}):`, error);
+    };
+
+    transport.onclose = () => {
+      const sid = transport.sessionId;
+      if (sid && this.httpSessions.has(sid)) {
+        logger.info(`MCP 会话已关闭: ${sid}`);
+        this.destroyHttpSession(sid, false);
+      }
     };
 
     // SDK 的 StreamableHTTPServerTransport 和 Transport 接口在 exactOptionalPropertyTypes 下有 onclose 可选性不一致
-    await this.mcpServer.connect(this.httpTransport as any);
+    await server.connect(transport as any);
+    await transport.handleRequest(req, res, parsedBody);
+  }
 
-    this.heartbeatFailures = 0;
-    this.startHeartbeat();
-    logger.info('HTTP transport 已建立（等待客户端 initialize）');
+  /**
+   * 销毁一个 HTTP 会话（停心跳、移出 map、关 transport）
+   */
+  private destroyHttpSession(sessionId: string, closeTransport = true): void {
+    const session = this.httpSessions.get(sessionId);
+    if (!session) {
+      return;
+    }
+    this.httpSessions.delete(sessionId);
+    if (session.heartbeatTimer) {
+      clearInterval(session.heartbeatTimer);
+      session.heartbeatTimer = null;
+    }
+    if (closeTransport) {
+      session.transport.close().catch(e => {
+        logger.warn(`关闭会话 ${sessionId} 的 transport 出错:`, e);
+      });
+    }
+    logger.info(`会话已销毁: ${sessionId}（剩余并发会话数: ${this.httpSessions.size}）`);
+  }
+
+  /**
+   * 每个会话独立心跳，连续失败只销毁自己，不影响其他会话
+   */
+  private startSessionHeartbeat(sessionId: string, session: HttpSession): void {
+    session.heartbeatTimer = setInterval(async () => {
+      if (!this.httpSessions.has(sessionId)) {
+        if (session.heartbeatTimer) {
+          clearInterval(session.heartbeatTimer);
+          session.heartbeatTimer = null;
+        }
+        return;
+      }
+      try {
+        await session.server.server.ping();
+        if (session.heartbeatFailures > 0) {
+          logger.info(`会话 ${sessionId} 心跳恢复（之前失败 ${session.heartbeatFailures} 次）`);
+        }
+        session.heartbeatFailures = 0;
+      } catch (error) {
+        session.heartbeatFailures++;
+        logger.warn(`会话 ${sessionId} 心跳失败 ${session.heartbeatFailures}/${HEARTBEAT_MAX_FAILURES}: ${error instanceof Error ? error.message : String(error)}`);
+        if (session.heartbeatFailures >= HEARTBEAT_MAX_FAILURES) {
+          logger.error(`会话 ${sessionId} 连续 ${HEARTBEAT_MAX_FAILURES} 次心跳失败，销毁该会话`);
+          this.destroyHttpSession(sessionId);
+        }
+      }
+    }, HEARTBEAT_INTERVAL_MS);
   }
 
   /**
@@ -658,11 +785,6 @@ export class MCPServer {
         if (this.heartbeatFailures >= HEARTBEAT_MAX_FAILURES) {
           logger.error(`连续 ${HEARTBEAT_MAX_FAILURES} 次心跳失败，transport 可能已断开`);
           this.stopHeartbeat();
-          // HTTP 模式：主动重建 transport，让下个客户端的 initialize 能成功
-          if (this.transportMode === 'http') {
-            logger.info('HTTP 模式：主动重建 transport 以便接受新客户端');
-            this.buildHttpTransport().catch(e => logger.error('心跳触发的 transport 重建失败:', e));
-          }
         }
       }
     }, HEARTBEAT_INTERVAL_MS);
@@ -693,14 +815,9 @@ export class MCPServer {
 
       this.stopHeartbeat();
 
-      // 关闭 HTTP transport（如果存在）
-      if (this.httpTransport) {
-        try {
-          await this.httpTransport.close();
-        } catch (e) {
-          logger.warn('关闭 HTTP transport 出错:', e);
-        }
-        this.httpTransport = null;
+      // 销毁所有 HTTP 会话（如果存在）
+      for (const sessionId of [...this.httpSessions.keys()]) {
+        this.destroyHttpSession(sessionId);
       }
 
       // 停止Web服务器
@@ -712,6 +829,7 @@ export class MCPServer {
       }
 
       this.isRunning = false;
+      this.isMcpRunning = false;
       logger.info('服务器已停止');
       
     } catch (error) {
@@ -727,10 +845,18 @@ export class MCPServer {
   /**
    * 获取服务器状态
    */
-  getStatus(): { running: boolean; webPort?: number | undefined } {
+  getStatus(): {
+    running: boolean;
+    webRunning: boolean;
+    webPort?: number | undefined;
+    mcpRunning: boolean;
+  } {
+    const webRunning = this.webServer.isRunning();
     return {
       running: this.isRunning,
-      webPort: this.webServer.isRunning() ? this.webServer.getPort() : undefined
+      webRunning,
+      webPort: webRunning ? this.webServer.getPort() : undefined,
+      mcpRunning: this.isMcpRunning
     };
   }
 }

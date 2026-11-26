@@ -42,6 +42,18 @@ export interface WorkSummary {
 export interface CollectFeedbackParams {
     work_summary: string;
 }
+export type FeedbackSessionStatus = 'waiting' | 'completed' | 'timed_out' | 'cancelled' | 'error' | 'not_found';
+export interface FeedbackSessionSnapshot {
+    session_id: string;
+    status: FeedbackSessionStatus;
+    work_summary?: string;
+    feedback: FeedbackData[];
+    created_at?: number;
+    deadline?: number;
+    remaining_seconds?: number;
+    feedback_url?: string;
+    message?: string;
+}
 export interface TextContent {
     type: 'text';
     text: string;

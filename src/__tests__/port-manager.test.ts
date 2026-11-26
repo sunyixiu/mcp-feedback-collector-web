@@ -2,6 +2,7 @@
  * 端口管理器测试
  */
 
+import { jest } from '@jest/globals';
 import { PortManager } from '../utils/port-manager.js';
 import { MCPError } from '../types/index.js';
 

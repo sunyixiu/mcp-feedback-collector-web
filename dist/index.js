@@ -8,5 +8,5 @@ export { logger } from './utils/logger.js';
 // 导出类型定义
 export * from './types/index.js';
 // 导出版本信息
-export const VERSION = '2.1.3';
+export const VERSION = '2.2.0';
 //# sourceMappingURL=index.js.map

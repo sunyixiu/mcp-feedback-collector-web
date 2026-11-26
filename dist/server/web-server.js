@@ -33,6 +33,15 @@ export class WebServer {
     imageToTextService;
     sessionStorage;
     mcpHttpHandler = null;
+    // 服务端权威超时：每个会话一个精确定时器（不受浏览器后台节流影响），
+    // 连续超时熔断计数也在服务端做（页面刷新不丢）。
+    sessionTimers = new Map();
+    consecutiveTimeouts = 0;
+    static MAX_CONSECUTIVE_TIMEOUTS = 30;
+    static RESULT_RETENTION_MS = 10 * 60 * 1000;
+    // 单次 wait_feedback 最长等待秒数。默认 45（保守，避免触发 Cursor 长 MCP 请求截断）；
+    // 可用环境变量 MCP_MAX_WAIT_SECONDS 调大（1~280），减少同一会话里重复调用 wait_feedback 的次数。
+    static MAX_WAIT_SECONDS = Math.min(280, Math.max(1, Math.floor(Number(process.env['MCP_MAX_WAIT_SECONDS'])) || 45));
     constructor(config) {
         this.config = config;
         this.portManager = new PortManager();
@@ -52,7 +61,12 @@ export class WebServer {
             cors: {
                 origin: config.corsOrigin,
                 methods: ['GET', 'POST']
-            }
+            },
+            // 默认 maxHttpBufferSize 仅 1MB，>1MB 的截图走 websocket 会直接断连（"发不出去"）。
+            // 提到 100MB，并放宽 ping 超时，避免大图传输期间被误判离线。
+            maxHttpBufferSize: 100 * 1024 * 1024,
+            pingTimeout: 60000,
+            pingInterval: 25000
         });
         this.setupMiddleware();
         this.setupRoutes();
@@ -163,7 +177,7 @@ export class WebServer {
         // API配置路由
         this.app.get('/api/config', (req, res) => {
             const chatConfig = {
-                api_key: this.config.apiKey || '',
+                api_key: this.config.apiKey || null,
                 api_base_url: this.config.apiBaseUrl || 'https://api.openai.com/v1',
                 model: this.config.defaultModel || 'gpt-4o-mini',
                 enable_chat: this.config.enableChat !== false, // 默认启用
@@ -192,7 +206,8 @@ export class WebServer {
                 workSummary: work_summary,
                 feedback: [],
                 startTime: Date.now(),
-                timeout: timeout_seconds * 1000
+                timeout: timeout_seconds * 1000,
+                status: 'waiting'
             };
             this.sessionStorage.createSession(sessionId, session);
             // 记录会话创建
@@ -393,6 +408,8 @@ export class WebServer {
                 const activeSessions = this.sessionStorage.getAllSessions();
                 let latestSession = null;
                 for (const [sessionId, session] of activeSessions) {
+                    if (session.status && session.status !== 'waiting')
+                        continue;
                     if (!latestSession || session.startTime > latestSession.session.startTime) {
                         latestSession = { sessionId, session };
                     }
@@ -408,7 +425,8 @@ export class WebServer {
                         work_summary: latestSession.session.workSummary,
                         timeout: remaining, // 剩余时间（毫秒）
                         total_timeout: latestSession.session.timeout, // 原始设定总时长
-                        elapsed_ms: elapsed // 已经过去的时间
+                        elapsed_ms: elapsed, // 已经过去的时间
+                        deadline: latestSession.session.startTime + latestSession.session.timeout // 绝对截止时间戳（服务端权威）
                     });
                 }
                 else {
@@ -426,6 +444,8 @@ export class WebServer {
                 const activeSessions = this.sessionStorage.getAllSessions();
                 let latestSession = null;
                 for (const [sessionId, session] of activeSessions) {
+                    if (session.status && session.status !== 'waiting')
+                        continue;
                     if (!latestSession || session.startTime > latestSession.session.startTime) {
                         latestSession = { sessionId, session };
                     }
@@ -437,7 +457,8 @@ export class WebServer {
                         success: true,
                         work_summary: latestSession.session.workSummary,
                         session_id: latestSession.sessionId,
-                        timestamp: latestSession.session.startTime
+                        timestamp: latestSession.session.startTime,
+                        deadline: latestSession.session.startTime + latestSession.session.timeout
                     });
                 }
                 else {
@@ -468,11 +489,13 @@ export class WebServer {
             socket.on('keep_alive', (data) => {
                 logger.socket('keep_alive', socket.id, data);
                 const session = this.sessionStorage.getSession(data.sessionId);
-                if (session) {
+                if (session && (!session.status || session.status === 'waiting')) {
                     session.startTime = Date.now();
                     this.sessionStorage.updateSession(data.sessionId, { startTime: session.startTime });
+                    // 服务端权威定时器同步重置
+                    this.armSessionTimer(data.sessionId, session.timeout);
                     logger.info(`会话 ${data.sessionId} 已保活，超时重置`);
-                    socket.emit('keep_alive_ack', { success: true, sessionId: data.sessionId });
+                    socket.emit('keep_alive_ack', { success: true, sessionId: data.sessionId, deadline: session.startTime + session.timeout });
                 }
                 else {
                     socket.emit('keep_alive_ack', { success: false, message: '会话不存在或已过期' });
@@ -507,15 +530,19 @@ export class WebServer {
             });
             return;
         }
+        if (session.status && session.status !== 'waiting') {
+            socket.emit('feedback_error', {
+                error: session.status === 'completed' ? '该会话已经提交过反馈' : '该会话已结束，无法继续提交'
+            });
+            return;
+        }
         try {
-            // 验证反馈数据
             if (!feedbackData.text && (!feedbackData.images || feedbackData.images.length === 0)) {
                 socket.emit('feedback_error', {
                     error: '请提供文字反馈或上传图片'
                 });
                 return;
             }
-            // 处理图片数据
             let processedFeedback = { ...feedbackData };
             if (feedbackData.images && feedbackData.images.length > 0) {
                 logger.info(`开始处理 ${feedbackData.images.length} 张图片...`);
@@ -533,19 +560,28 @@ export class WebServer {
                     return;
                 }
             }
-            // 添加反馈到会话
             session.feedback.push(processedFeedback);
-            this.sessionStorage.updateSession(feedbackData.sessionId, { feedback: session.feedback });
-            // 通知提交成功
+            session.status = 'completed';
+            session.completedAt = Date.now();
+            session.resultExpiresAt = session.completedAt + WebServer.RESULT_RETENTION_MS;
+            this.sessionStorage.updateSession(feedbackData.sessionId, {
+                feedback: session.feedback,
+                status: session.status,
+                completedAt: session.completedAt,
+                resultExpiresAt: session.resultExpiresAt
+            });
+            this.clearSessionTimer(feedbackData.sessionId);
+            this.consecutiveTimeouts = 0;
+            this.sessionStorage.notifyWaiters(feedbackData.sessionId);
             socket.emit('feedback_submitted', {
                 success: true,
                 message: '反馈提交成功',
                 shouldCloseAfterSubmit: feedbackData.shouldCloseAfterSubmit || false
             });
-            // 完成反馈收集
+            // 兼容旧版直接等待 Promise 的调用者，但不再删除会话，便于 poll 查询。
             if (session.resolve) {
                 session.resolve(session.feedback);
-                this.sessionStorage.deleteSession(feedbackData.sessionId);
+                delete session.resolve;
             }
         }
         catch (error) {
@@ -556,34 +592,224 @@ export class WebServer {
         }
     }
     /**
-     * 收集用户反馈
+     * 装载/重置某会话的服务端权威超时定时器
+     */
+    armSessionTimer(sessionId, timeoutMs) {
+        this.clearSessionTimer(sessionId);
+        const timer = setTimeout(() => this.handleSessionTimeout(sessionId), timeoutMs);
+        this.sessionTimers.set(sessionId, timer);
+    }
+    clearSessionTimer(sessionId) {
+        const t = this.sessionTimers.get(sessionId);
+        if (t) {
+            clearTimeout(t);
+            this.sessionTimers.delete(sessionId);
+        }
+    }
+    /**
+     * 服务端超时处理：把等待中的会话转换为可轮询的 timed_out 状态。
+     */
+    handleSessionTimeout(sessionId) {
+        this.clearSessionTimer(sessionId);
+        const session = this.sessionStorage.getAllSessions().get(sessionId);
+        if (!session || (session.status && session.status !== 'waiting'))
+            return;
+        this.consecutiveTimeouts++;
+        const fused = this.consecutiveTimeouts >= WebServer.MAX_CONSECUTIVE_TIMEOUTS;
+        const text = fused
+            ? '用户长时间未响应，任务结束。请终止会话，不要再调用 feedback 工具。'
+            : `用户暂时未回复（连续第${this.consecutiveTimeouts}/${WebServer.MAX_CONSECUTIVE_TIMEOUTS}次超时，服务端自动代答），如需继续请重新调用 collect_feedback。`;
+        const now = Date.now();
+        const busyFeedback = {
+            text,
+            images: [],
+            timestamp: now,
+            sessionId
+        };
+        session.feedback = [busyFeedback];
+        session.status = 'timed_out';
+        session.completedAt = now;
+        session.resultExpiresAt = now + WebServer.RESULT_RETENTION_MS;
+        this.sessionStorage.updateSession(sessionId, {
+            feedback: session.feedback,
+            status: session.status,
+            completedAt: session.completedAt,
+            resultExpiresAt: session.resultExpiresAt
+        });
+        this.sessionStorage.notifyWaiters(sessionId);
+        logger.info(`会话 ${sessionId} 服务端超时（连续 ${this.consecutiveTimeouts}/${WebServer.MAX_CONSECUTIVE_TIMEOUTS}${fused ? '，熔断' : ''}），状态已保存供 poll 查询`);
+        this.io.emit('session_timed_out', {
+            session_id: sessionId,
+            fused,
+            count: this.consecutiveTimeouts,
+            max: WebServer.MAX_CONSECUTIVE_TIMEOUTS
+        });
+        if (session.resolve) {
+            session.resolve([busyFeedback]);
+            delete session.resolve;
+        }
+        if (fused) {
+            this.consecutiveTimeouts = 0;
+        }
+    }
+    /**
+     * 创建反馈会话，立即返回句柄，不在 MCP 请求中等待浏览器回复。
+     */
+    async createFeedbackSession(workSummary, timeoutSeconds) {
+        if (!this.isServerRunning) {
+            await this.start();
+        }
+        const sessionId = this.generateSessionId();
+        const now = Date.now();
+        const timeoutMs = Math.max(10, timeoutSeconds) * 1000;
+        const session = {
+            workSummary,
+            feedback: [],
+            startTime: now,
+            timeout: timeoutMs,
+            status: 'waiting'
+        };
+        this.sessionStorage.createSession(sessionId, session);
+        this.armSessionTimer(sessionId, timeoutMs);
+        performanceMonitor.recordSessionCreated();
+        const feedbackUrl = this.generateFeedbackUrl(sessionId);
+        logger.info(`创建异步反馈会话: ${sessionId}, 超时: ${timeoutSeconds}秒`);
+        logger.mcpFeedbackPageCreated(sessionId, feedbackUrl, timeoutSeconds);
+        // 浏览器打开失败不会阻塞 MCP 调用；失败状态仍可通过 wait/poll 读取。
+        void this.openFeedbackPage(sessionId).catch(error => {
+            logger.error('打开反馈页面失败:', error);
+            const current = this.sessionStorage.getSession(sessionId);
+            if (!current || current.status !== 'waiting')
+                return;
+            current.status = 'error';
+            current.error = error instanceof Error ? error.message : '无法打开反馈页面';
+            current.completedAt = Date.now();
+            current.resultExpiresAt = current.completedAt + WebServer.RESULT_RETENTION_MS;
+            this.clearSessionTimer(sessionId);
+            this.sessionStorage.updateSession(sessionId, {
+                status: current.status,
+                error: current.error,
+                completedAt: current.completedAt,
+                resultExpiresAt: current.resultExpiresAt
+            });
+            this.sessionStorage.notifyWaiters(sessionId);
+        });
+        const snapshot = this.buildFeedbackSnapshot(sessionId, session);
+        snapshot.feedback_url = feedbackUrl;
+        return snapshot;
+    }
+    /**
+     * 最多等待一小段时间，避免触发 Cursor 的长 MCP 请求超时。
+     */
+    async waitForFeedback(sessionId, waitSeconds = WebServer.MAX_WAIT_SECONDS) {
+        const initial = this.pollFeedback(sessionId);
+        if (initial.status !== 'waiting')
+            return initial;
+        const session = this.sessionStorage.getSession(sessionId);
+        if (!session || session.status !== 'waiting')
+            return this.pollFeedback(sessionId);
+        const waitMs = Math.min(Math.max(1, Math.floor(waitSeconds)) * 1000, WebServer.MAX_WAIT_SECONDS * 1000);
+        return new Promise((resolve) => {
+            let settled = false;
+            let timer = null;
+            const finish = () => {
+                if (settled)
+                    return;
+                settled = true;
+                if (timer)
+                    clearTimeout(timer);
+                if (session.waiters) {
+                    const index = session.waiters.indexOf(finish);
+                    if (index >= 0)
+                        session.waiters.splice(index, 1);
+                }
+                resolve(this.pollFeedback(sessionId));
+            };
+            session.waiters ??= [];
+            session.waiters.push(finish);
+            // 避免注册等待者和状态变化之间的竞态。
+            if (session.status !== 'waiting') {
+                finish();
+                return;
+            }
+            timer = setTimeout(finish, waitMs);
+        });
+    }
+    /**
+     * 立即读取会话状态；若刚好越过 deadline，则主动执行一次超时收口。
+     */
+    pollFeedback(sessionId) {
+        const session = this.sessionStorage.getSession(sessionId);
+        if (!session) {
+            return {
+                session_id: sessionId,
+                status: 'not_found',
+                feedback: [],
+                message: '会话不存在，可能已过期或服务已重启'
+            };
+        }
+        if ((session.status ?? 'waiting') === 'waiting' && Date.now() >= session.startTime + session.timeout) {
+            this.handleSessionTimeout(sessionId);
+        }
+        const current = this.sessionStorage.getSession(sessionId);
+        return current
+            ? this.buildFeedbackSnapshot(sessionId, current)
+            : {
+                session_id: sessionId,
+                status: 'not_found',
+                feedback: [],
+                message: '会话不存在，可能已过期或服务已重启'
+            };
+    }
+    /**
+     * 旧版 API 兼容：保留直接等待的内部方法，新的 MCP 工具不调用它。
      */
     async collectFeedback(workSummary, timeoutSeconds) {
+        if (!this.isServerRunning) {
+            await this.start();
+        }
         const sessionId = this.generateSessionId();
-        logger.info(`创建反馈会话: ${sessionId}, 超时: ${timeoutSeconds}秒`);
+        const now = Date.now();
+        const timeoutMs = Math.max(10, timeoutSeconds) * 1000;
         return new Promise((resolve, reject) => {
-            // 创建会话
             const session = {
                 workSummary,
                 feedback: [],
-                startTime: Date.now(),
-                timeout: timeoutSeconds * 1000,
+                startTime: now,
+                timeout: timeoutMs,
+                status: 'waiting',
                 resolve,
                 reject
             };
             this.sessionStorage.createSession(sessionId, session);
-            // 生成反馈页面URL
+            this.armSessionTimer(sessionId, timeoutMs);
             const feedbackUrl = this.generateFeedbackUrl(sessionId);
-            // 发送MCP日志通知，包含反馈页面信息
+            logger.info(`创建旧版直接等待会话: ${sessionId}, 超时: ${timeoutSeconds}秒`);
             logger.mcpFeedbackPageCreated(sessionId, feedbackUrl, timeoutSeconds);
-            // 注意：超时处理现在由SessionStorage的清理机制处理
-            // 打开浏览器
-            this.openFeedbackPage(sessionId).catch(error => {
+            void this.openFeedbackPage(sessionId).catch(error => {
                 logger.error('打开反馈页面失败:', error);
+                this.clearSessionTimer(sessionId);
                 this.sessionStorage.deleteSession(sessionId);
                 reject(error);
             });
         });
+    }
+    buildFeedbackSnapshot(sessionId, session) {
+        const status = session.status ?? 'waiting';
+        const deadline = session.startTime + session.timeout;
+        const remaining = status === 'waiting' ? Math.max(0, Math.ceil((deadline - Date.now()) / 1000)) : 0;
+        const snapshot = {
+            session_id: sessionId,
+            status,
+            work_summary: session.workSummary,
+            feedback: session.feedback || [],
+            created_at: session.startTime,
+            deadline,
+            remaining_seconds: remaining
+        };
+        if (session.error)
+            snapshot.message = session.error;
+        return snapshot;
     }
     /**
      * 生成反馈页面URL
@@ -591,13 +817,13 @@ export class WebServer {
     generateFeedbackUrl(sessionId) {
         // 如果启用了固定URL模式，返回根路径
         if (this.config.useFixedUrl) {
-            // 优先使用配置的服务器基础URL
+            // 固定页面地址仍需携带会话参数，页面才能绑定正确的反馈会话。
+            const separator = this.config.serverBaseUrl?.includes('?') ? '&' : '?';
             if (this.config.serverBaseUrl) {
-                return this.config.serverBaseUrl;
+                return `${this.config.serverBaseUrl}${separator}mode=feedback&session=${sessionId}`;
             }
-            // 使用配置的主机名
             const host = this.config.serverHost || 'localhost';
-            return `http://${host}:${this.port}`;
+            return `http://${host}:${this.port}/?mode=feedback&session=${sessionId}`;
         }
         // 传统模式：包含会话ID参数
         if (this.config.serverBaseUrl) {
@@ -612,6 +838,27 @@ export class WebServer {
     async openFeedbackPage(sessionId) {
         const url = this.generateFeedbackUrl(sessionId);
         logger.info(`打开反馈页面: ${url}`);
+        // 已有页面连着（Socket.IO 客户端在线）就不弹新标签，页面会自动拉到新会话
+        const clients = this.io?.engine?.clientsCount ?? 0;
+        if (clients > 0) {
+            logger.info(`已有 ${clients} 个客户端连接，跳过自动打开浏览器`);
+            return;
+        }
+        // Windows 服务（SYSTEM / Session 0）里 open() 弹出的浏览器用户桌面看不见：
+        // 配置 MCP_BROWSER_OPEN_TASK 后，改为触发以登录用户身份注册的计划任务来开浏览器
+        const taskName = process.env['MCP_BROWSER_OPEN_TASK'];
+        if (taskName && process.platform === 'win32') {
+            const { execFile } = await import('child_process');
+            execFile('schtasks', ['/run', '/tn', taskName], (err) => {
+                if (err) {
+                    logger.warn(`计划任务 ${taskName} 触发失败: ${err.message}，请手动访问 ${url}`);
+                }
+                else {
+                    logger.info(`已通过计划任务 ${taskName} 在用户会话打开浏览器`);
+                }
+            });
+            return;
+        }
         try {
             const open = await import('open');
             await open.default(url);
@@ -665,10 +912,16 @@ export class WebServer {
                     clearTimeout(timeout);
                     if (error) {
                         reject(error);
+                        return;
                     }
-                    else {
-                        resolve();
+                    // 端口为 0 时由操作系统动态分配，必须以实际监听地址为准。
+                    const address = this.server.address();
+                    if (!address || typeof address === 'string') {
+                        reject(new Error('Server did not expose a bound port'));
+                        return;
                     }
+                    this.port = address.port;
+                    resolve();
                 };
                 if (bindHost) {
                     this.server.listen(this.port, bindHost, onListen);
@@ -750,6 +1003,9 @@ export class WebServer {
         logger.info(`正在停止Web服务器 (端口: ${currentPort})...`);
         try {
             // 清理所有活跃会话
+            for (const t of this.sessionTimers.values())
+                clearTimeout(t);
+            this.sessionTimers.clear();
             this.sessionStorage.clear();
             this.sessionStorage.stopCleanupTimer();
             // 关闭所有WebSocket连接
